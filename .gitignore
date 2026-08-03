@@ -1,0 +1,7 @@
+*.o
+*.d
+cachepilot
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
