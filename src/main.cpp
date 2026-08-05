@@ -1,6 +1,101 @@
-#include <iostream>
+#include "aof.h"
+#include "admin.h"
+#include "server.h"
+#include "storage.h"
 
-int main() {
-    std::cout << "CachePilot\n";
+#include <csignal>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <thread>
+
+using namespace std;
+
+namespace {
+
+Server* g_server = nullptr;
+AdminServer* g_admin = nullptr;
+
+void handle_signal(int) {
+    if (g_server != nullptr) {
+        g_server->stop();
+    }
+    if (g_admin != nullptr) {
+        g_admin->stop();
+    }
+}
+
+void print_usage(const char* prog) {
+    cerr << "usage: " << prog
+         << " [--port PORT] [--admin-port PORT] [--memory-limit MB] "
+            "[--aof-file FILE]\n";
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    int port = 6379;
+    int admin_port = 8080;
+    size_t memory_mb = 64;
+    string aof_file = "cachepilot.aof";
+
+    for (int i = 1; i < argc; ++i) {
+        const string arg = argv[i];
+        auto next_value = [&](const string& name) -> string {
+            if (i + 1 >= argc) {
+                cerr << "missing value for " << name << "\n";
+                exit(1);
+            }
+            return argv[++i];
+        };
+        try {
+            if (arg == "--port") {
+                port = stoi(next_value(arg));
+            } else if (arg == "--admin-port") {
+                admin_port = stoi(next_value(arg));
+            } else if (arg == "--memory-limit") {
+                memory_mb = static_cast<size_t>(stoul(next_value(arg)));
+            } else if (arg == "--aof-file") {
+                aof_file = next_value(arg);
+            } else if (arg == "--help" || arg == "-h") {
+                print_usage(argv[0]);
+                return 0;
+            } else {
+                cerr << "unknown option: " << arg << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+        } catch (const invalid_argument&) {
+            cerr << "invalid numeric value for " << arg << "\n";
+            return 1;
+        }
+    }
+
+    Storage storage(memory_mb * 1024 * 1024);
+    AOFLogger aof(aof_file);
+    aof.replay(&storage);
+
+    Server server(port, &storage, &aof);
+    AdminServer admin(admin_port, &storage);
+
+    struct sigaction sa {};
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
+    g_admin = &admin;
+    thread admin_thread([&admin] { admin.start(); });
+
+    g_server = &server;
+    cout << "CachePilot listening on port " << port << ", admin on port "
+         << admin_port << ", policies: lru, lfu, sieve" << endl;
+    server.start();
+    g_server = nullptr;
+
+    admin.stop();
+    admin_thread.join();
+    g_admin = nullptr;
+
     return 0;
 }
