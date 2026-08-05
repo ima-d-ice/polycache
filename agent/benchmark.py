@@ -2,7 +2,7 @@
 """CachePilot workload benchmark.
 
 Measures real behavior of a running CachePilot server (./cachepilot) under
-four scenarios: policy pinned to lru / lfu / sieve, and 'sentinel' where
+four scenarios: policy pinned to lru / lfu / sieve, and 'pilot' where
 the tuning agent (agent.py) runs alongside and switches policies.
 
 Every number in the summary comes from live TCP/HTTP exchanges with the
@@ -21,7 +21,7 @@ from pathlib import Path
 from metrics import fetch_metrics
 
 STATIC_POLICY = {"static_lru": "lru", "static_lfu": "lfu", "static_sieve": "sieve"}
-MODES = ("static_lru", "static_lfu", "static_sieve", "sentinel")
+MODES = ("static_lru", "static_lfu", "static_sieve", "pilot")
 WORKLOADS = ("zipfian", "uniform", "sequential", "mixed")
 POLICY_Y = {"lru": 0.0, "lfu": 1.0, "sieve": 2.0}
 
@@ -240,7 +240,7 @@ def print_summary(results, cfg) -> None:
               "hit rates converge near 1.0. Restart the server with a small "
               "--memory-limit or use --pressure to make policies differ." % cfg.keys)
     print("note: modes share one live server, so earlier modes leave state "
-          "(hot keys, leftovers) that later modes inherit -- sentinel is most "
+          "(hot keys, leftovers) that later modes inherit -- pilot is most "
           "affected. For isolated measurements use --mode <single> against a "
           "freshly started server.")
 
@@ -284,15 +284,15 @@ def _agent_decisions(path):
     return decisions
 
 
-def plot_sentinel(results, cfg) -> None:
+def plot_pilot(results, cfg) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    sentinel = [r for r in results if r[0] == "sentinel"]
-    if not sentinel:
+    pilot = [r for r in results if r[0] == "pilot"]
+    if not pilot:
         return
-    samples = sentinel[0][1]
+    samples = pilot[0][1]
     if not samples:
         return
 
@@ -304,7 +304,7 @@ def plot_sentinel(results, cfg) -> None:
     ax.set_yticklabels(list(POLICY_Y.keys()))
     ax.set_xlabel("requests issued")
     ax.set_ylabel("eviction policy")
-    ax.set_title("Sentinel mode: agent policy switches")
+    ax.set_title("Pilot mode: agent policy switches")
 
     switch_points = []
     for i in range(1, len(samples)):
@@ -335,7 +335,7 @@ def plot_sentinel(results, cfg) -> None:
                 color="tab:red")
 
     fig.tight_layout()
-    out = "%ssentinel_decisions.png" % cfg.plot_prefix
+    out = "%spilot_decisions.png" % cfg.plot_prefix
     fig.savefig(out)
     plt.close(fig)
     print("saved %s" % out)
@@ -348,7 +348,7 @@ def plot_sentinel(results, cfg) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="CachePilot benchmark: measure a running server under "
-                    "fixed policies and under agent (sentinel) control.")
+                    "fixed policies and under agent (pilot) control.")
     parser.add_argument("--mode", default="all", choices=MODES + ("all",))
     parser.add_argument("--workload", default="mixed", choices=WORKLOADS)
     parser.add_argument("--requests", type=int, default=50000)
@@ -391,7 +391,7 @@ def main(argv=None) -> int:
 
     print_summary(results, args)
     plot_hit_rates(results, args)
-    plot_sentinel(results, args)
+    plot_pilot(results, args)
     return 0
 
 
