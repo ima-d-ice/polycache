@@ -57,10 +57,12 @@ One request per connection; `Connection: close`.
       eviction/      SIEVE / LRU / LFU policies
       third_party/   nlohmann/json (vendored single header)
     agent/           Python tuning agent + phased benchmark tool
-      benchmark.py   eviction-policy benchmark (static + pilot modes)
+      benchmark.py   eviction-policy benchmark (static + pilot + --compare)
       agent.py       LangGraph tuning agent (fetch -> analyze -> decide -> act)
+      llm_client.py  opt-in multi-model Groq client (round-robin + failover)
       analyzer.py    workload classifier (zipf / scan / churn signals)
       metrics.py     admin-endpoint client (fetch_metrics + signal helpers)
+      compare_report.py  renders RESULTS_COMPARISON.md from --compare JSON
 
 ## Benchmark & tuning
 
@@ -102,3 +104,37 @@ hit rate drops >10% after a switch).  Every decision is logged to
 
     python3 agent/benchmark.py --mode pilot --requests 90000 \
         --cache-size-mb 1 --hot-size 11000 --seed 7 --spawn-agent
+
+## Optional LLM decision layer (opt-in)
+
+`agent.py` has three decision modes (default `rule`):
+
+    python3 agent/agent.py --decision-mode rule    # heuristics only (default)
+    python3 agent/agent.py --decision-mode llm     # LLM picks the policy
+    python3 agent/agent.py --decision-mode hybrid  # rule decides, LLM logged as 2nd opinion
+
+The LLM layer is strictly opt-in: with no keys configured the agent warns
+once and falls back to `rule` mode, and any failed LLM consult falls back
+to the rule-based decision for that cycle.  Keys are read from the
+environment as `GROQ_API_KEY_1` .. `GROQ_API_KEY_N` (contiguous, stopping
+at the first gap), rotated one key per request.
+
+Models rotate per call: gpt-oss-120b -> llama-3.3-70b-versatile ->
+qwen-3.6-27b.  On 429/503 the client backs off (1s/2s/4s) and after
+exhausted retries fails over to the next model; all three failing (or an
+unparseable / invalid response) raises `LLMError` and the agent falls back
+to rules.  Per-model call counters are available via
+`RoundRobinLLMClient.get_stats()`.
+
+A/B comparison across the three modes (each sub-run on a fresh server
+replaying the same workload; llm/hybrid sub-runs are capped with
+`--llm-requests`, default 10000):
+
+    python3 agent/benchmark.py --compare --requests 50000 --cache-size-mb 1 \
+        --hot-size 11000 --seed 7 --spawn-agent
+
+Writes `hit_rate_comparison.png`, `llm_latency_vs_requests.png`,
+`model_distribution.png`, and `compare_results.json`; renders the report
+with:
+
+    python3 agent/compare_report.py          # -> agent/RESULTS_COMPARISON.md

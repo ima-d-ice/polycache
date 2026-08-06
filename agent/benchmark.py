@@ -37,6 +37,7 @@ fails loudly.
 """
 
 import argparse
+import collections
 import json
 import os
 import random
@@ -330,7 +331,8 @@ def spawn_agent(cfg):
            "--cooldown", str(cfg.agent_cooldown),
            "--interval", str(cfg.agent_interval),
            "--access-log", str(cfg.access_log),
-           "--log", str(cfg.agent_log)]
+           "--log", str(cfg.agent_log),
+           "--decision-mode", str(cfg.decision_mode)]
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
@@ -635,6 +637,234 @@ def plot_pilot(results, cfg) -> None:
 
 
 # --------------------------------------------------------------------------
+# A/B comparison: rule vs llm vs hybrid decision modes
+# --------------------------------------------------------------------------
+
+COMPARE_MODES = ("rule", "llm", "hybrid")
+
+
+def _llm_stats(decisions):
+    """Aggregate LLM telemetry out of the agent's kind:"llm" log lines."""
+    llm_lines = [d for d in decisions if d.get("kind") == "llm"]
+    ok = [d for d in llm_lines
+          if d.get("fallback") is not True and d.get("llm_model")]
+    fall = [d for d in llm_lines if d.get("fallback") is True]
+    lat = [float(d.get("llm_latency_ms", 0.0)) for d in ok]
+    tokens_p = sum(int(d.get("llm_tokens_prompt", 0) or 0) for d in ok)
+    tokens_c = sum(int(d.get("llm_tokens_completion", 0) or 0) for d in ok)
+    agreements = [int(d.get("agreement", -1)) for d in ok if "agreement" in d]
+    return {
+        "api_calls": len(llm_lines),
+        "ok_calls": len(ok),
+        "fallback": len(fall),
+        "fallback_pct": round(100.0 * len(fall) / len(llm_lines), 1)
+                        if llm_lines else 0.0,
+        "avg_latency_ms": round(sum(lat) / len(lat), 2) if lat else 0.0,
+        "max_latency_ms": round(max(lat), 2) if lat else 0.0,
+        "tokens_prompt": tokens_p,
+        "tokens_completion": tokens_c,
+        "tokens_total": tokens_p + tokens_c,
+        "agreement_pct": (round(100.0 * sum(agreements) / len(agreements), 1)
+                          if agreements else None),
+        "models": dict(collections.Counter(d.get("llm_model") for d in ok)),
+    }
+
+
+def compare_all(cfg, workload, preload_keys):
+    """Run rule / llm / hybrid back to back, each on a fresh server.
+
+    Every sub-run replays the SAME generated workload (the LLM sub-runs are
+    capped at --llm-requests, default 10000, so a live API run stays cheap).
+    Per-mode files (AOF / access telemetry / decision log) keep the runs
+    from interfering with each other.
+    """
+    results = {}
+    for mode in COMPARE_MODES:
+        print("\n== compare sub-run: %s ==" % mode)
+        cfg.aof_path = Path("%s.compare.%s.aof" % (cfg.aof_prefix, mode))
+        cfg.server_log = Path("%s.compare.%s.log" % (cfg.aof_prefix, mode))
+        cfg.access_log = Path("%s.compare.%s.access.jsonl" %
+                              (cfg.aof_prefix, mode))
+        cfg.agent_log = "%s.compare.%s.decisions.jsonl" % (cfg.aof_prefix, mode)
+        n_req = (cfg.requests if mode == "rule"
+                 else min(cfg.requests, cfg.llm_requests))
+        cfg.decision_mode = mode
+
+        server = start_server(cfg)
+        telemetry_fh = open(cfg.access_log, "a", encoding="utf-8")
+        agent = spawn_agent(cfg)
+        time.sleep(0.3)
+        samples, stats = run_mode("compare_%s" % mode, workload[:n_req],
+                                  preload_keys, cfg, telemetry_fh)
+        if agent is not None:
+            agent.terminate()
+            try:
+                agent.wait(2)
+            except subprocess.TimeoutExpired:
+                agent.kill()
+        telemetry_fh.close()
+        stop_server(server)
+
+        decisions = _agent_decisions(cfg.agent_log)
+        results[mode] = {
+            "samples": samples,
+            "stats": stats,
+            "requests": n_req,
+            "_log_path": cfg.agent_log,
+            "llm_stats": _llm_stats(decisions),
+            "switches": [
+                {"timestamp": d.get("timestamp", ""),
+                 "old_policy": d.get("old_policy", ""),
+                 "new_policy": d.get("new_policy", "")}
+                for d in decisions if d.get("kind") == "switch"
+            ],
+        }
+
+    # Multi-model assertion: with 10+ successful LLM decisions at least two
+    # different models must have been consulted (round-robin works).
+    ok_calls = sum(v["llm_stats"]["ok_calls"] for v in results.values())
+    distinct = set()
+    for v in results.values():
+        distinct.update(v["llm_stats"]["models"].keys())
+    if ok_calls >= 10 and len(distinct) < 2:
+        raise AssertionError(
+            "expected >=2 distinct LLM models over %d calls, saw %r"
+            % (ok_calls, sorted(distinct)))
+
+    _plot_compare(results, cfg)
+    _dump_compare_json(results, cfg)
+    _print_compare_table(results, cfg)
+    return results
+
+
+def _print_compare_table(results, cfg) -> None:
+    header = ("%-7s | %10s | %8s | %8s | %8s | %9s | %10s | %11s | %16s" %
+              ("Mode", "Overall HR", "P1 HR", "P2 HR", "P3 HR", "Switches",
+               "LLM Calls", "Fallback %", "Avg LLM Latency"))
+    print("\n" + header)
+    print("-" * len(header))
+    for mode in COMPARE_MODES:
+        v = results[mode]
+        ls = v["llm_stats"]
+        print("%-7s | %9.4f | %7.4f | %7.4f | %7.4f | %8d | %9d | %10.1f | %15.2fms"
+              % (mode, v["stats"]["overall"], v["stats"]["phase_rates"][1],
+                 v["stats"]["phase_rates"][2], v["stats"]["phase_rates"][3],
+                 v["stats"]["switches"], ls["api_calls"], ls["fallback_pct"],
+                 ls["avg_latency_ms"]))
+    print("-" * len(header))
+    if cfg.llm_requests < cfg.requests:
+        print("note: llm/hybrid sub-runs capped at --llm-requests %d "
+              "(rule ran the full %d requests); hit rates are not directly "
+              "comparable across the cap." % (cfg.llm_requests, cfg.requests))
+
+
+def _plot_compare(results, cfg) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # 1) hit rate curves for all three decision modes.
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for mode in COMPARE_MODES:
+        samples = results[mode]["samples"]
+        ax.plot([s["requests"] for s in samples],
+                [s["overall_hit_rate"] for s in samples],
+                marker="o", markersize=3, label=mode)
+    ax.set_xlabel("requests issued")
+    ax.set_ylabel("hit rate (overall)")
+    ax.set_ylim(0.0, 1.05)
+    ax.set_title("Decision-mode comparison (rule / llm / hybrid, "
+                 "fresh server each)")
+    ax.legend()
+    fig.tight_layout()
+    out = "%shit_rate_comparison.png" % cfg.plot_prefix
+    fig.savefig(out)
+    plt.close(fig)
+    print("saved %s" % out)
+
+    # 2) LLM latency per decision, colored by the model that answered.
+    model_colors = {"gpt-oss-120b": "tab:blue",
+                    "llama-3.3-70b-versatile": "tab:orange",
+                    "qwen-3.6-27b": "tab:green"}
+    fig, ax = plt.subplots(figsize=(9, 6))
+    seen = set()
+    for mode in ("llm", "hybrid"):
+        decisions = _agent_decisions(results[mode].get("_log_path"))
+        pts = [(i, float(d.get("llm_latency_ms", 0.0)), d.get("llm_model"))
+               for i, d in enumerate(decisions)
+               if d.get("kind") == "llm" and d.get("llm_model")]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        if not ys:
+            continue
+        for (i, y, model) in pts:
+            ax.scatter(i, y, s=12, alpha=0.8,
+                       color=model_colors.get(model, "tab:gray"))
+            seen.add(model)
+    handles = [plt.Line2D([], [], marker="o", linestyle="None", markersize=6,
+                          color=model_colors.get(m, "tab:gray"), label=m)
+               for m in sorted(seen)]
+    ax.legend(handles=handles)
+    ax.set_xlabel("decision cycle (index within run)")
+    ax.set_ylabel("LLM latency (ms)")
+    ax.set_title("LLM decision latency (fallback cycles excluded)")
+    fig.tight_layout()
+    out = "%sllm_latency_vs_requests.png" % cfg.plot_prefix
+    fig.savefig(out)
+    plt.close(fig)
+    print("saved %s" % out)
+
+    # 3) model distribution pie across llm + hybrid.
+    counts = collections.Counter()
+    for mode in ("llm", "hybrid"):
+        counts.update(results[mode]["llm_stats"]["models"])
+    if counts:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.pie(list(counts.values()),
+               labels=list(counts.keys()),
+               autopct="%1.0f%%",
+               colors=[model_colors.get(m, "tab:gray") for m in counts])
+        ax.set_title("LLM model usage (llm + hybrid sub-runs)")
+        fig.tight_layout()
+        out = "%smodel_distribution.png" % cfg.plot_prefix
+        fig.savefig(out)
+        plt.close(fig)
+        print("saved %s" % out)
+
+
+def _dump_compare_json(results, cfg) -> None:
+    payload = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "config": {
+            "requests": cfg.requests,
+            "llm_requests": cfg.llm_requests,
+            "working_set": cfg.working_set,
+            "cache_size_mb": cfg.cache_size_mb,
+            "value_size": cfg.value_size,
+            "seed": getattr(cfg, "seed", None),
+            "hot_size": cfg.hot_size,
+            "burst_size": cfg.burst_size,
+            "scan_size": cfg.scan_size,
+        },
+        "modes": {},
+    }
+    for mode in COMPARE_MODES:
+        v = results[mode]
+        payload["modes"][mode] = {
+            "requests": v["requests"],
+            "overall": v["stats"]["overall"],
+            "phase_rates": v["stats"]["phase_rates"],
+            "switches": v["stats"]["switches"],
+            "switch_log": v["switches"],
+            "llm_stats": v["llm_stats"],
+        }
+    out = "%scompare_results.json" % cfg.plot_prefix
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    print("saved %s" % out)
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -688,6 +918,16 @@ def main(argv=None) -> int:
                         help="start agent.py for the pilot mode")
     parser.add_argument("--agent-cooldown", type=float, default=1.0)
     parser.add_argument("--agent-interval", type=float, default=1.0)
+    parser.add_argument("--decision-mode", default="rule",
+                        choices=("rule", "llm", "hybrid"),
+                        help="agent decision mode for the pilot / compare "
+                             "sub-runs (default rule)")
+    parser.add_argument("--compare", action="store_true",
+                        help="A/B run: rule -> llm -> hybrid on fresh "
+                             "servers, then comparison plots + JSON")
+    parser.add_argument("--llm-requests", type=int, default=10000,
+                        help="cap the llm/hybrid compare sub-runs to this "
+                             "many requests (keeps live API runs cheap)")
     parser.add_argument("--plot-prefix", default="")
     args = parser.parse_args(argv)
 
@@ -709,6 +949,9 @@ def main(argv=None) -> int:
     if args.hot_size < 1 or args.scan_size < 1 or args.burst_size < 1:
         print("--hot-size/--scan-size/--burst-size must be positive",
               file=sys.stderr)
+        return 1
+    if args.llm_requests < 10:
+        print("--llm-requests must be >= 10", file=sys.stderr)
         return 1
     cap = cache_capacity(args.cache_size_mb, args.value_size)
     if args.hot_size + args.burst_size > cap:
@@ -754,6 +997,9 @@ def main(argv=None) -> int:
     agent = None
     telemetry_fh = None
     try:
+        if args.compare:
+            compare_all(args, workload, preload_keys)
+            return 0
         for mode in modes:
             print("\n== mode %s ==" % mode)
             server = start_server(args)

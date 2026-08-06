@@ -19,6 +19,7 @@ from langgraph.graph import END, StateGraph
 
 from analyzer import WorkloadAnalyzer
 from metrics import compute_zipf_coefficient, detect_scan_pattern, fetch_metrics
+from llm_client import LLMError, RoundRobinLLMClient
 
 POLICY_FOR_WORKLOAD = {
     "skewed": "sieve",
@@ -26,6 +27,8 @@ POLICY_FOR_WORKLOAD = {
     "stable": "lfu",
     "bursty": "sieve",
 }
+
+DECISION_MODES = ("rule", "llm", "hybrid")
 
 
 class AgentState(TypedDict, total=False):
@@ -55,6 +58,7 @@ class TuningAgent:
         rollback_drop: float = 0.10,
         log_path: Optional[str] = None,
         access_log_path: Optional[str] = None,
+        decision_mode: str = "rule",
     ) -> None:
         self.cache_host = cache_host
         self.cache_port = cache_port
@@ -96,6 +100,30 @@ class TuningAgent:
             except OSError as exc:
                 self.logger.error("cannot open access log %s: %s",
                                   access_log_path, exc)
+
+        # Optional LLM decision layer.  Strictly opt-in: with no Groq keys
+        # in the environment the agent warns once and stays on the rules.
+        self.decision_mode = decision_mode if decision_mode in DECISION_MODES \
+            else "rule"
+        self._llm: Optional[RoundRobinLLMClient] = None
+        if decision_mode in ("llm", "hybrid"):
+            client = RoundRobinLLMClient()
+            if not client.ready:
+                self.logger.warning(
+                    "WARNING: Groq keys (GROQ_API_KEY_1..N) not found in "
+                    "environment. Falling back to rule mode."
+                )
+                self.decision_mode = "rule"
+            else:
+                self.decision_mode = decision_mode
+                self._llm = client
+                self.logger.info(
+                    "LLM decision layer active (mode=%s, %d model(s), "
+                    "%d key(s))",
+                    decision_mode,
+                    len(client.models),
+                    client.key_count(),
+                )
 
         self._graph = self._build_graph()
 
@@ -156,6 +184,55 @@ class TuningAgent:
             "total_keys": metrics.get("total_keys", 0),
         }
 
+    def set_llm_client(self, client: Optional[RoundRobinLLMClient]) -> None:
+        """Testing hook: inject a (mock) LLM client and switch to llm mode."""
+        self._llm = client
+        self.decision_mode = "llm" if client is not None else "rule"
+
+    def _llm_decide(self, state: AgentState) -> Optional[Dict]:
+        """One LLM consult per cycle; writes a per-cycle ``kind:"llm"`` log.
+
+        Returns the client's pick dict on success, or None when no LLM is
+        configured or the consult failed (rule-based fallback).  The log
+        carries model/latency/tokens so the benchmark can report LLM stats
+        even when no switch is made.
+        """
+        llm = self._llm
+        if llm is None:
+            return None
+        current = state.get("current_policy", "")
+        workload = str(state.get("workload", ""))
+        payload = {
+            "kind": "llm",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "current_policy": current,
+            "workload_class": workload,
+            "rule_policy": POLICY_FOR_WORKLOAD.get(workload, ""),
+            "metrics_snapshot": self._snapshot(state),
+        }
+        try:
+            pick = llm.decide_policy(state.get("metrics", {}),
+                                     workload, current)
+        except LLMError as exc:
+            payload.update({"llm_policy": None, "fallback": True})
+            self._log_decision(payload)
+            self.logger.warning(
+                "LLM decision failed, falling back to rule-based (%s)", exc)
+            return None
+        payload.update({
+            "llm_policy": pick["policy"],
+            "llm_reason": pick.get("reason", ""),
+            "llm_model": pick["model_used"],
+            "llm_latency_ms": pick["latency_ms"],
+            "llm_tokens_prompt": pick["tokens_prompt"],
+            "llm_tokens_completion": pick["tokens_completion"],
+            "fallback": False,
+        })
+        if self.decision_mode == "hybrid":
+            payload["agreement"] = int(pick["policy"] == payload["rule_policy"])
+        self._log_decision(payload)
+        return pick
+
     # -------------------------------------------------------------- nodes
 
     def fetch(self, state: AgentState) -> Dict:
@@ -214,15 +291,27 @@ class TuningAgent:
                 }
 
         target = POLICY_FOR_WORKLOAD.get(str(state.get("workload", "")), "")
+        if self.decision_mode == "llm":
+            llm_pick = self._llm_decide(state)
+            if llm_pick is not None:
+                target = llm_pick["policy"]
+        elif self.decision_mode == "hybrid":
+            self._llm_decide(state)  # second opinion, logged only
         if target and target != current:
             if cooldown_ok:
+                if self.decision_mode == "llm" and llm_pick is not None:
+                    reason = ("llm[%s] chose %s: %s"
+                              % (llm_pick["model_used"], target,
+                                 llm_pick.get("reason", "") or "no reason"))
+                else:
+                    reason = (
+                        f"workload classified as {state.get('workload')}, "
+                        f"hit_rate={hit_rate:.3f}"
+                    )
                 return {
                     "action": "switch",
                     "desired_policy": target,
-                    "reason": (
-                        f"workload classified as {state.get('workload')}, "
-                        f"hit_rate={hit_rate:.3f}"
-                    ),
+                    "reason": reason,
                 }
             return {
                 "action": "wait",
@@ -343,6 +432,11 @@ def main() -> None:
                              "(drives zipf/scan detection)")
     parser.add_argument("--cycles", type=int, default=-1,
                         help="run N cycles then exit (-1 = forever)")
+    parser.add_argument("--decision-mode", default="rule",
+                        choices=DECISION_MODES,
+                        help="rule = heuristic only (default); llm = LLM "
+                             "chooses the policy; hybrid = rule decides, "
+                             "LLM logged as a second opinion")
     args = parser.parse_args()
 
     agent = TuningAgent(
@@ -353,6 +447,7 @@ def main() -> None:
         cooldown_seconds=args.cooldown,
         log_path=args.log,
         access_log_path=args.access_log,
+        decision_mode=args.decision_mode,
     )
     try:
         agent.run(args.interval, args.cycles)

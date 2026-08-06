@@ -1,3 +1,4 @@
 langgraph
 matplotlib
 requests
+openai

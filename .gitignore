@@ -7,3 +7,5 @@ __pycache__/
 .venv/
 AGENTS.md
 *.png
+compare_results.json
+.env
