@@ -8,6 +8,7 @@ test_storage
 __pycache__/
 *.pyc
 .venv/
+venv/
 AGENTS.md
 *.png
 compare_results.json
