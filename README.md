@@ -127,8 +127,10 @@ to rules.  Per-model call counters are available via
 `RoundRobinLLMClient.get_stats()`.
 
 A/B comparison across the three modes (each sub-run on a fresh server
-replaying the same workload; llm/hybrid sub-runs are capped with
-`--llm-requests`, default 10000):
+replaying the same workload).  Fair by default: every mode runs the full
+`--requests` length.  An explicit `--llm-requests` cap (cheaper API spend)
+produces unequal-length sub-runs and triggers a loud NOT-COMPARABLE
+warning — it exists only for cheap smoke tests:
 
     python3 agent/benchmark.py --compare --requests 50000 --cache-size-mb 1 \
         --hot-size 11000 --seed 7 --spawn-agent

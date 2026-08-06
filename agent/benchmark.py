@@ -673,11 +673,18 @@ def _llm_stats(decisions):
 def compare_all(cfg, workload, preload_keys):
     """Run rule / llm / hybrid back to back, each on a fresh server.
 
-    Every sub-run replays the SAME generated workload (the LLM sub-runs are
-    capped at --llm-requests, default 10000, so a live API run stays cheap).
-    Per-mode files (AOF / access telemetry / decision log) keep the runs
-    from interfering with each other.
+    Every sub-run replays the SAME generated workload: by default all three
+    run the full --requests length so the hit rates are comparable.  An
+    explicit --llm-requests cap shrinks the llm/hybrid sub-runs (cheaper
+    API spend) but makes the run NOT comparable -- a loud warning is
+    printed and flagged in the JSON/report.
     """
+    capped = (cfg.llm_requests > 0 and cfg.llm_requests < cfg.requests)
+    if capped:
+        print("\nWARNING: --llm-requests %d < --requests %d.  The llm/hybrid "
+              "sub-runs will be SHORTER than rule, so hit rates are NOT "
+              "comparable across modes.  Drop --llm-requests (default) to "
+              "hide\n" % (cfg.llm_requests, cfg.requests), file=sys.stderr)
     results = {}
     for mode in COMPARE_MODES:
         print("\n== compare sub-run: %s ==" % mode)
@@ -686,8 +693,17 @@ def compare_all(cfg, workload, preload_keys):
         cfg.access_log = Path("%s.compare.%s.access.jsonl" %
                               (cfg.aof_prefix, mode))
         cfg.agent_log = "%s.compare.%s.decisions.jsonl" % (cfg.aof_prefix, mode)
+        # Truncate the per-mode append-only files: a leftover from a previous
+        # run/sub-run would pollute the LLM stats and switch log below.
+        for path in (cfg.aof_path, cfg.server_log, cfg.access_log,
+                     Path(cfg.agent_log)):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         n_req = (cfg.requests if mode == "rule"
-                 else min(cfg.requests, cfg.llm_requests))
+                 else (min(cfg.requests, cfg.llm_requests)
+                       if cfg.llm_requests > 0 else cfg.requests))
         cfg.decision_mode = mode
 
         server = start_server(cfg)
@@ -752,10 +768,12 @@ def _print_compare_table(results, cfg) -> None:
                  v["stats"]["switches"], ls["api_calls"], ls["fallback_pct"],
                  ls["avg_latency_ms"]))
     print("-" * len(header))
-    if cfg.llm_requests < cfg.requests:
-        print("note: llm/hybrid sub-runs capped at --llm-requests %d "
-              "(rule ran the full %d requests); hit rates are not directly "
-              "comparable across the cap." % (cfg.llm_requests, cfg.requests))
+    if cfg.llm_requests > 0 and cfg.llm_requests < cfg.requests:
+        print("\nWARNING: llm/hybrid sub-runs were capped at %d requests "
+              "while rule ran the full %d -- these hit rates are NOT "
+              "comparable across modes.  Re-run with --llm-requests 0 "
+              "(default) for a fair comparison."
+              % (cfg.llm_requests, cfg.requests))
 
 
 def _plot_compare(results, cfg) -> None:
@@ -838,6 +856,7 @@ def _dump_compare_json(results, cfg) -> None:
         "config": {
             "requests": cfg.requests,
             "llm_requests": cfg.llm_requests,
+            "capped": cfg.llm_requests > 0 and cfg.llm_requests < cfg.requests,
             "working_set": cfg.working_set,
             "cache_size_mb": cfg.cache_size_mb,
             "value_size": cfg.value_size,
@@ -925,9 +944,11 @@ def main(argv=None) -> int:
     parser.add_argument("--compare", action="store_true",
                         help="A/B run: rule -> llm -> hybrid on fresh "
                              "servers, then comparison plots + JSON")
-    parser.add_argument("--llm-requests", type=int, default=10000,
+    parser.add_argument("--llm-requests", type=int, default=0,
                         help="cap the llm/hybrid compare sub-runs to this "
-                             "many requests (keeps live API runs cheap)")
+                             "many requests (0 = same as --requests, the "
+                             "fair default; a smaller cap makes the run "
+                             "cheaper but NOT comparable across modes)")
     parser.add_argument("--plot-prefix", default="")
     args = parser.parse_args(argv)
 
@@ -950,8 +971,9 @@ def main(argv=None) -> int:
         print("--hot-size/--scan-size/--burst-size must be positive",
               file=sys.stderr)
         return 1
-    if args.llm_requests < 10:
-        print("--llm-requests must be >= 10", file=sys.stderr)
+    if args.llm_requests < 0:
+        print("--llm-requests must be >= 0 (0 = run all modes at --requests)",
+              file=sys.stderr)
         return 1
     cap = cache_capacity(args.cache_size_mb, args.value_size)
     if args.hot_size + args.burst_size > cap:

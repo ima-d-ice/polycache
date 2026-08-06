@@ -66,11 +66,20 @@ def build_report(data: dict, results_path: Path) -> str:
     rule = modes["rule"]
     llm = modes["llm"]
     hyb = modes["hybrid"]
+    capped = bool(config.get("capped", False)) or (
+        config.get("llm_requests", 0) > 0
+        and config["llm_requests"] < config.get("requests", 0))
     gap_llm = (llm["overall"] - rule["overall"]) * 100.0
     gap_hyb = (hyb["overall"] - rule["overall"]) * 100.0
     best = max(MODES, key=lambda m: modes[m]["overall"])
 
-    if gap_llm >= 1.0 or gap_hyb >= 1.0:
+    if capped:
+        rec = ("**NOT COMPARABLE.** The llm/hybrid sub-runs were capped at "
+               "%d requests while rule ran %d, so every hit-rate difference "
+               "is an artifact of unequal workload length.  Re-run with "
+               "--llm-requests 0 (the default) for a fair comparison."
+               % (config.get("llm_requests", 0), config.get("requests", 0)))
+    elif gap_llm >= 1.0 or gap_hyb >= 1.0:
         winners = [name for name, gap in (("llm", gap_llm), ("hybrid", gap_hyb))
                    if gap >= 1.0]
         rec = ("Adopt **%s** decision mode for workloads like this one: it "
@@ -106,11 +115,13 @@ def build_report(data: dict, results_path: Path) -> str:
                                      for m in MODES),
         },
         "- LLM mode: %s vs rule (%.2f pt)." % (
-            "better" if gap_llm > 0 else "worse",
+            ("not comparable (capped run)" if capped
+             else "better" if gap_llm > 0 else "worse"),
             gap_llm,
         ),
         "- Hybrid mode: %s vs rule (%.2f pt)." % (
-            "better" if gap_hyb > 0 else "worse",
+            "not comparable (capped run)" if capped
+            else "better" if gap_hyb > 0 else "worse",
             gap_hyb,
         ),
         "- LLM fallback rate (rule-mode safety net): llm %s, hybrid %s."
@@ -135,11 +146,11 @@ def build_report(data: dict, results_path: Path) -> str:
              ("%.2f ms" % ls["avg_latency_ms"]
               if ls.get("avg_latency_ms") else "-")))
     lines.append("")
-    if config.get("llm_requests", config.get("requests")) < config.get("requests"):
+    if capped:
         lines.append(
-            "_Note: llm/hybrid sub-runs were capped at %d requests while rule "
-            "ran %d; phase hit rates above are per-sub-run and not strictly "
-            "comparable across the cap._"
+            "> **WARNING: this run is NOT comparable.** llm/hybrid sub-runs "
+            "were capped at %d requests while rule ran %d; hit rates differ "
+            "because the workloads differ, not because of the decision mode."
             % (config["llm_requests"], config["requests"]))
         lines.append("")
 
@@ -194,10 +205,10 @@ def build_report(data: dict, results_path: Path) -> str:
     lines += [
         "## Model Reliability",
         "",
-        "- Fallback rate (LLMError -> rule decision): llm %s, hybrid %s. "
-        "The rule fallback fired on every failed consult, so LLM outages "
-        "degrade decisions to the rule baseline rather than crashing the "
-        "agent."
+        "- Fallback rate (LLMError -> rule decision): llm %s, hybrid %s "
+        "-- every consult succeeded in this run.  When a consult does fail, "
+        "the agent logs it and falls back to the rule decision for that "
+        "cycle instead of crashing."
         % (_fmt_pct(llm_stats.get("fallback_pct")),
            _fmt_pct(hyb_stats.get("fallback_pct"))),
         "- Successful-call model distribution (llm run): " +
