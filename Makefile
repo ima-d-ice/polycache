@@ -3,7 +3,7 @@ CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -pthread -MMD -MP
 SRCS     := $(shell find src -name '*.cpp')
 OBJS     := $(SRCS:.cpp=.o)
 DEPS     := $(OBJS:.o=.d)
-TARGET   := cachepilot
+TARGET   := kybernetes
 TESTS    := test_sieve test_protocol test_storage
 
 all: $(TARGET)

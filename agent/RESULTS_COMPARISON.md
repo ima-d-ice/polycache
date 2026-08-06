@@ -1,4 +1,4 @@
-# CachePilot: Rule vs LLM vs Hybrid Decision Modes
+# Kybernetes: Rule vs LLM vs Hybrid Decision Modes
 
 A/B comparison of the agent's three decision modes, each run on a fresh server replaying the identical generated workload (90000 requests, 1MB cache, 100000-key space, seed 7).
 

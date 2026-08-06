@@ -99,7 +99,7 @@ def build_report(data: dict, results_path: Path) -> str:
     hyb_stats = hyb.get("llm_stats", {})
 
     lines = [
-        "# CachePilot: Rule vs LLM vs Hybrid Decision Modes",
+        "# Kybernetes: Rule vs LLM vs Hybrid Decision Modes",
         "",
         "A/B comparison of the agent's three decision modes, each run on a "
         "fresh server replaying the identical generated workload "

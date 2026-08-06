@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
     int port = 6379;
     int admin_port = 8080;
     size_t memory_mb = 64;
-    string aof_file = "cachepilot.aof";
+    string aof_file = "kybernetes.aof";
 
     for (int i = 1; i < argc; ++i) {
         const string arg = argv[i];
@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
     thread admin_thread([&admin] { admin.start(); });
 
     g_server = &server;
-    cout << "CachePilot listening on port " << port << ", admin on port "
+    cout << "Kybernetes listening on port " << port << ", admin on port "
          << admin_port << ", policies: lru, lfu, sieve" << endl;
     server.start();
     g_server = nullptr;

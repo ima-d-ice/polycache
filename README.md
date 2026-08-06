@@ -1,4 +1,4 @@
-# CachePilot
+# Kybernetes
 
 A self-tuning in-memory cache server written in C++17, paired with an autonomous LangGraph agent that swaps eviction policies at runtime to match the workload — no restart, no downtime.
 
@@ -19,6 +19,16 @@ Three decision modes are available and A/B comparable on identical workloads:
 | `hybrid` | Rule decides; the LLM acts as a logged second opinion |
 
 The LLM layer is strictly opt-in (Groq, round-robin across three models with failover), costs on the order of $0.001 per benchmark run, and falls back to rules on any failure.
+
+### Results at a glance (90K requests, 1 MB cache, seed 7)
+
+| Mode | Overall hit rate | vs Rule |
+|---|---|---|
+| rule | 63.5% | — |
+| llm | 63.2% | −0.3 pt |
+| **hybrid** | **71.5%** | **+8.0 pt** |
+
+Hybrid wins in every benchmark run (also +5.8 pt at 30K). Eviction-policy divergence (LFU/SIEVE vs LRU) is reproducible across 5 seeds. Full numbers: [Benchmarks](#benchmarks) and `agent/RESULTS_COMPARISON.md`.
 
 ## Architecture
 
@@ -94,14 +104,14 @@ sequenceDiagram
 ## Quick Start
 
 ```sh
-make                 # builds ./cachepilot
+make                 # builds ./kybernetes
 make test            # builds + runs the unit tests (all green)
 
-./cachepilot [--port PORT] [--admin-port PORT] \
+./kybernetes [--port PORT] [--admin-port PORT] \
              [--memory-limit MB] [--aof-file FILE]
 ```
 
-Defaults: cache port `6379`, admin port `8080`, memory limit `64` MB, AOF file `cachepilot.aof`. `SIGINT`/`SIGTERM` trigger graceful shutdown. Builds on Linux (real epoll) and macOS (compatibility shim in `src/epoll_compat.h`).
+Defaults: cache port `6379`, admin port `8080`, memory limit `64` MB, AOF file `kybernetes.aof`. `SIGINT`/`SIGTERM` trigger graceful shutdown. Builds on Linux (real epoll) and macOS (compatibility shim in `src/epoll_compat.h`).
 
 ## Protocol & API
 
@@ -134,7 +144,7 @@ curl -s http://127.0.0.1:8080/health
 
 ## Benchmarks
 
-`agent/benchmark.py` starts a fresh `cachepilot` for every mode, preloads exactly the cache's key capacity, and replays one generated workload so every policy measures the same request sequence.
+`agent/benchmark.py` starts a fresh `kybernetes` for every mode, preloads exactly the cache's key capacity, and replays one generated workload so every policy measures the same request sequence.
 
 ```sh
 python3 agent/benchmark.py --mode all --requests 90000 \

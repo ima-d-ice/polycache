@@ -1,6 +1,6 @@
 *.o
 *.d
-cachepilot
+kybernetes
 test_sieve
 test_protocol
 test_storage

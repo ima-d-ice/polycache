@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""CachePilot workload benchmark with real eviction pressure.
+"""Kybernetes workload benchmark with real eviction pressure.
 
-Starts a FRESH CachePilot server for every mode (kills any running
-cachepilot, restarts with --memory-limit <cache-size-mb> and a clean
+Starts a FRESH Kybernetes server for every mode (kills any running
+kybernetes, restarts with --memory-limit <cache-size-mb> and a clean
 temporary AOF), preloads a working set much larger than the cache, then
 runs three workload phases that force eviction DURING measurement:
 
@@ -262,15 +262,15 @@ def switch_policy(ls: LineSocket, policy: str) -> bool:
 # --------------------------------------------------------------------------
 
 def kill_server() -> None:
-    proc = subprocess.run(["pkill", "-x", "cachepilot"],
+    proc = subprocess.run(["pkill", "-x", "kybernetes"],
                           capture_output=True, text=True)
     if proc.returncode == 0:
-        print("killed existing cachepilot process")
+        print("killed existing kybernetes process")
     time.sleep(0.25)
 
 
 def start_server(cfg):
-    """Kill any cachepilot, start a fresh one with a small memory limit."""
+    """Kill any kybernetes, start a fresh one with a small memory limit."""
     kill_server()
     if not cfg.server_path.exists():
         print("server binary not found: %s (run 'make' first)" % cfg.server_path,
@@ -554,7 +554,7 @@ def plot_hit_rates(results, cfg) -> None:
     ax.set_xlabel("requests issued")
     ax.set_ylabel("hit rate (overall)")
     ax.set_ylim(0.0, 1.05)
-    ax.set_title("CachePilot hit rate vs requests "
+    ax.set_title("Kybernetes hit rate vs requests "
                  "(fresh %dMB server per mode)" % cfg.cache_size_mb)
     ax.legend()
     fig.tight_layout()
@@ -889,7 +889,7 @@ def _dump_compare_json(results, cfg) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="CachePilot benchmark: fresh per-mode server, phased "
+        description="Kybernetes benchmark: fresh per-mode server, phased "
                     "workload with real eviction pressure, policy comparison.")
     parser.add_argument("--mode", default="all", choices=MODES + ("all",))
     parser.add_argument("--requests", type=int, default=50000)
@@ -928,8 +928,8 @@ def main(argv=None) -> int:
     parser.add_argument("--admin-host", default="localhost")
     parser.add_argument("--admin-port", type=int, default=8080)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--server-path", default=str(SCRIPT_DIR.parent / "cachepilot"))
-    parser.add_argument("--aof-prefix", default="/tmp/cachepilot_bench")
+    parser.add_argument("--server-path", default=str(SCRIPT_DIR.parent / "kybernetes"))
+    parser.add_argument("--aof-prefix", default="/tmp/kybernetes_bench")
     parser.add_argument("--wait-timeout", type=float, default=10.0)
     parser.add_argument("--agent-log", default=None,
                         help="agent decision JSONL for plot annotations")
