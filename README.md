@@ -16,6 +16,29 @@ High-performance in-memory cache server written in C++17.
 Builds on Linux (real `epoll`) and macOS (poll-based compatibility shim in
 `src/epoll_compat.h`). The only vendored dependency is nlohmann/json.
 
+### Tests
+
+    make test    # builds and runs the unit tests (no framework or external deps)
+
+Plain C++17 assertions in `tests/`, compiled straight to test binaries:
+
+- `test_sieve` — insertion-order eviction, `touch()`/visited-skip semantics,
+  middle `remove()` relinking, size accounting, re-add updates
+- `test_protocol` — SET / GET / DEL / METRICS / SWITCH_POLICY, verb
+  case-insensitivity, whitespace + tab splitting, trim, `UNKNOWN` verbs
+- `test_storage` — set/get/del + hit/miss counters, deterministic eviction
+  under a memory limit, `switch_policy` (case-insensitive, keys preserved),
+  TTL expiry
+
+Example output (two integration passes before commit):
+
+    == test_sieve
+    ok sieve (6 groups)
+    == test_protocol
+    ok protocol (8 groups)
+    == test_storage
+    ok storage (4 groups)
+
 ## Run
 
     ./cachepilot [--port PORT] [--admin-port PORT] [--memory-limit MB] [--aof-file FILE]
@@ -94,6 +117,23 @@ points behind LFU/SIEVE.  Key flags: `--mode` (all|static_lru|static_lfu|
 static_sieve|pilot), `--cache-size-mb`, `--value-size`, `--cold-ratio`,
 `--scan-write-ratio`, `--burst-size`, `--hot-size`, `--requests`, `--seed`.
 
+Multi-seed consistency (same config, five seeds; this only shows at
+`--requests 90000` — at 30K the per-phase churn is too low and every
+policy measures identically):
+
+    Seed  | Overall LRU | Overall LFU/SIEVE | P3 LRU | P3 LFU/SIEVE
+    ------|-------------|-------------------|--------|--------------
+    1     |    0.2517   |      0.3913       | 0.1993 |    0.4634
+    7     |    0.1583   |      0.3003       | 0.1153 |    0.3828
+    42    |    0.1365   |      0.2778       | 0.0977 |    0.3660
+    123   |    0.1278   |      0.2670       | 0.0909 |    0.3536
+    999   |    0.1407   |      0.2839       | 0.0969 |    0.3679
+
+LFU/SIEVE beat LRU in P2/P3 at every seed (P3 gap +0.26 to +0.28 absolute,
+2.3x-3.9x relative); absolute numbers vary seed to seed, the divergence
+does not.  Note `pilot` measures identical to `static_lru` when the agent
+is not spawned (LRU is the default policy and no `SWITCH_POLICY` fires).
+
 Pilot mode runs the tuning agent (`agent.py`, optionally spawned with
 `--spawn-agent`): it polls the admin metrics endpoint and the benchmark's
 access telemetry, classifies the workload, and issues `SWITCH_POLICY`
@@ -140,3 +180,16 @@ Writes `hit_rate_comparison.png`, `llm_latency_vs_requests.png`,
 with:
 
     python3 agent/compare_report.py          # -> agent/RESULTS_COMPARISON.md
+
+Fair-run results (equal-length 30K sub-runs, seed 7, 1 MB cache) are
+reported in `agent/RESULTS_COMPARISON.md`: rule 0.7107, LLM 0.7369,
+hybrid 0.7685 overall.  The LLM and hybrid modes each made 15 model calls
+(5 per model, round-robin) with 0% fallbacks.
+
+Discussion: hybrid consistently beat the LLM mode despite agreeing with
+the rule-based decision only ~27% of the time.  The working hypothesis:
+hybrid executes the rule decision but consults the LLM as a validator, so
+when they disagree the LLM tends to veto or re-time a switch rather than
+pick a different policy — rule speed plus LLM caution.  This is
+speculative; the per-decision `kind:"llm"` JSONL lines would be the
+evidence if probed further.
