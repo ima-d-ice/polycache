@@ -21,7 +21,7 @@ def _least_squares_slope(y: List[float]) -> float:
 
 
 class WorkloadAnalyzer:
-    """Sliding-window analysis of Kybernetes metric snapshots.
+    """Sliding-window analysis of AdaptiCache metric snapshots.
 
     Keeps the last ``window_size`` snapshots (default 20) and derives
     hit-rate trend, churn, volatility, and a workload classification.

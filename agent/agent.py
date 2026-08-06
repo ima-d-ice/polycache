@@ -1,4 +1,4 @@
-"""Kybernetes autonomous tuning agent.
+"""AdaptiCache autonomous tuning agent.
 
 Runs a LangGraph pipeline (fetch -> analyze -> decide -> act) on a loop.
 Each cycle polls the admin HTTP endpoint for metrics, classifies the
@@ -46,7 +46,7 @@ class AgentState(TypedDict, total=False):
 
 
 class TuningAgent:
-    """Stateful agent that tunes a running Kybernetes instance."""
+    """Stateful agent that tunes a running AdaptiCache instance."""
 
     def __init__(
         self,
@@ -74,7 +74,7 @@ class TuningAgent:
         # (previous_policy, baseline_hit_rate, snapshot_count_at_switch)
         self.rollback_info: Optional[tuple] = None
 
-        self.logger = logging.getLogger("kybernetes-agent")
+        self.logger = logging.getLogger("adapticache-agent")
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             handler.setFormatter(
@@ -416,7 +416,7 @@ class TuningAgent:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kybernetes tuning agent")
+    parser = argparse.ArgumentParser(description="AdaptiCache tuning agent")
     parser.add_argument("--cache-host", default="localhost")
     parser.add_argument("--cache-port", type=int, default=6379)
     parser.add_argument("--admin-host", default="localhost")

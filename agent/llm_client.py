@@ -1,4 +1,4 @@
-"""Optional LLM decision client for the Kybernetes tuning agent.
+"""Optional LLM decision client for the AdaptiCache tuning agent.
 
 Talks to Groq's OpenAI-compatible endpoint.  The client is strictly opt-in:
 with no keys it initializes cleanly but every ``decide_policy`` call raises

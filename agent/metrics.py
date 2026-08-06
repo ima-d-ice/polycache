@@ -1,4 +1,4 @@
-"""Collect runtime metrics from the Kybernetes server."""
+"""Collect runtime metrics from the AdaptiCache server."""
 
 import math
 from typing import Dict, List
@@ -9,7 +9,7 @@ import requests
 def fetch_metrics(
     host: str = "localhost", port: int = 8080, timeout: float = 2.0
 ) -> dict:
-    """Poll the Kybernetes admin HTTP endpoint and return the metrics JSON."""
+    """Poll the AdaptiCache admin HTTP endpoint and return the metrics JSON."""
     url = f"http://{host}:{port}/metrics"
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()

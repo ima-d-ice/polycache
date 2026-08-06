@@ -1,4 +1,4 @@
-# Kybernetes
+# AdaptiCache
 
 A self-tuning in-memory cache server written in C++17, paired with an autonomous LangGraph agent that swaps eviction policies at runtime to match the workload — no restart, no downtime.
 
@@ -104,14 +104,14 @@ sequenceDiagram
 ## Quick Start
 
 ```sh
-make                 # builds ./kybernetes
+make                 # builds ./adaptivecache
 make test            # builds + runs the unit tests (all green)
 
-./kybernetes [--port PORT] [--admin-port PORT] \
+./adaptivecache [--port PORT] [--admin-port PORT] \
              [--memory-limit MB] [--aof-file FILE]
 ```
 
-Defaults: cache port `6379`, admin port `8080`, memory limit `64` MB, AOF file `kybernetes.aof`. `SIGINT`/`SIGTERM` trigger graceful shutdown. Builds on Linux (real epoll) and macOS (compatibility shim in `src/epoll_compat.h`).
+Defaults: cache port `6379`, admin port `8080`, memory limit `64` MB, AOF file `adapticache.aof`. `SIGINT`/`SIGTERM` trigger graceful shutdown. Builds on Linux (real epoll) and macOS (compatibility shim in `src/epoll_compat.h`).
 
 ## Protocol & API
 
@@ -144,7 +144,7 @@ curl -s http://127.0.0.1:8080/health
 
 ## Benchmarks
 
-`agent/benchmark.py` starts a fresh `kybernetes` for every mode, preloads exactly the cache's key capacity, and replays one generated workload so every policy measures the same request sequence.
+`agent/benchmark.py` starts a fresh `adapticache` for every mode, preloads exactly the cache's key capacity, and replays one generated workload so every policy measures the same request sequence.
 
 ```sh
 python3 agent/benchmark.py --mode all --requests 90000 \

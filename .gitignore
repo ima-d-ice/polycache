@@ -1,6 +1,6 @@
 *.o
 *.d
-kybernetes
+adapticache
 test_sieve
 test_protocol
 test_storage
@@ -13,3 +13,4 @@ AGENTS.md
 *.png
 compare_results.json
 .env
+kybernetes
