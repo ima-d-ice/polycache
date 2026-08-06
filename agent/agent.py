@@ -11,6 +11,7 @@ import json
 import logging
 import socket
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, TypedDict
 
@@ -53,6 +54,7 @@ class TuningAgent:
         cooldown_seconds: float = 30.0,
         rollback_drop: float = 0.10,
         log_path: Optional[str] = None,
+        access_log_path: Optional[str] = None,
     ) -> None:
         self.cache_host = cache_host
         self.cache_port = cache_port
@@ -82,6 +84,19 @@ class TuningAgent:
             self._decision_fh = open(log_path, "a", encoding="utf-8")
             self.logger.info("decision log: %s", log_path)
 
+        # Access telemetry (JSONL written by the benchmark): drives the
+        # zipf / scan_ratio signals that the analyzer classifies on.
+        self._access_fh = None
+        self._key_counts: Dict[str, int] = {}
+        self._access_history: deque = deque(maxlen=5000)
+        if access_log_path:
+            try:
+                self._access_fh = open(access_log_path, "r", encoding="utf-8")
+                self.logger.info("access telemetry: %s", access_log_path)
+            except OSError as exc:
+                self.logger.error("cannot open access log %s: %s",
+                                  access_log_path, exc)
+
         self._graph = self._build_graph()
 
     # ------------------------------------------------------------------ I/O
@@ -105,6 +120,28 @@ class TuningAgent:
         if self._decision_fh:
             self._decision_fh.write(line + "\n")
             self._decision_fh.flush()
+
+    def _ingest_access_log(self) -> None:
+        """Read new lines from the benchmark's access telemetry file.
+
+        An open file handle acts as a tail: each call picks up the lines
+        appended since the previous call.  Lines are {"op": ..., "key": ...}.
+        """
+        if self._access_fh is None:
+            return
+        try:
+            for line in self._access_fh:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                key = entry.get("key")
+                if not key:
+                    continue
+                self._key_counts[key] = self._key_counts.get(key, 0) + 1
+                self._access_history.append(key)
+        except (OSError, ValueError) as exc:
+            self.logger.error("access log read failed: %s", exc)
 
     def _snapshot(self, state: AgentState) -> Dict:
         metrics = state.get("metrics", {})
@@ -258,7 +295,14 @@ class TuningAgent:
         while max_cycles < 0 or cycle < max_cycles:
             cycle += 1
             try:
-                result = self._graph.invoke({})
+                self._ingest_access_log()
+                initial: Dict = {}
+                if self._key_counts or self._access_history:
+                    initial = {
+                        "key_access_counts": dict(self._key_counts),
+                        "access_history": list(self._access_history),
+                    }
+                result = self._graph.invoke(initial)
                 if result.get("action") == "done":
                     dec = result.get("decision", {})
                     self.logger.info(
@@ -277,6 +321,9 @@ class TuningAgent:
         if self._decision_fh:
             self._decision_fh.close()
             self._decision_fh = None
+        if self._access_fh:
+            self._access_fh.close()
+            self._access_fh = None
 
 
 def main() -> None:
@@ -291,6 +338,9 @@ def main() -> None:
                         help="minimum seconds between policy switches")
     parser.add_argument("--log", default=None,
                         help="JSON-lines file for every decision")
+    parser.add_argument("--access-log", default=None,
+                        help="JSONL access telemetry written by benchmark.py "
+                             "(drives zipf/scan detection)")
     parser.add_argument("--cycles", type=int, default=-1,
                         help="run N cycles then exit (-1 = forever)")
     args = parser.parse_args()
@@ -302,6 +352,7 @@ def main() -> None:
         admin_port=args.admin_port,
         cooldown_seconds=args.cooldown,
         log_path=args.log,
+        access_log_path=args.access_log,
     )
     try:
         agent.run(args.interval, args.cycles)
