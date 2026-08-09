@@ -46,6 +46,21 @@ SYSTEM_PROMPT = (
     "workload."
 )
 
+SWITCH_EVAL_PROMPT = (
+    "You are a cache policy switch risk assessor. The rule-based classifier "
+    "proposes switching from current_policy to proposed_policy. Your job is "
+    "to approve or veto this specific switch. Consider: (1) switch cost -- "
+    "switching rebuilds the eviction state from scratch and briefly "
+    "destroys the policy's protection of the hot keys, so do not switch "
+    "unless the signals strongly favor it; (2) whether proposed_policy was "
+    "tried recently and failed (see recent_switches); (3) whether the "
+    "signals (zipf, scan_ratio, churn, trend, volatility) support the "
+    "proposal. Reply with EXACTLY one JSON object and nothing else: "
+    '{"approve": true or false, "confidence": 0.0 to 1.0, '
+    '"reason": "<10 words why>"}. Set approve=true ONLY if you are '
+    "confident the switch improves hit rate."
+)
+
 
 class LLMError(Exception):
     """Raised when an LLM decision cannot be produced."""
@@ -154,43 +169,10 @@ class RoundRobinLLMClient:
 
     # ----------------------------------------------------------- decide
 
-    def decide_policy(
-        self,
-        metrics: Dict,
-        workload_class: str = "",
-        current_policy: str = "",
-    ) -> Dict:
-        """Ask the LLM which eviction policy to run.
-
-        Returns {policy, reason, model_used, latency_ms, tokens_prompt,
-        tokens_completion}.  Raises ``LLMError`` when every model fails or
-        the response is unparseable / names an unknown policy.
-        """
-        if not self.ready:
-            raise LLMError(
-                "no Groq keys in environment (GROQ_API_KEY_1..N not found)"
-            )
-
-        user_content = json.dumps(
-            {
-                "current_policy": current_policy or "unknown",
-                "workload_class": workload_class or "unknown",
-                "metrics": {
-                    "hit_rate": round(float(metrics.get("hit_rate", 0.0)), 4),
-                    "miss_rate": round(float(metrics.get("miss_rate", 0.0)), 4),
-                    "hits": int(metrics.get("hits", 0)),
-                    "misses": int(metrics.get("misses", 0)),
-                    "requests": int(metrics.get("requests", 0)),
-                    "total_keys": int(metrics.get("total_keys", 0)),
-                },
-            }
-        )
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
-
-        # Per-call rotation: the primary model for THIS call.
+    def _chat(self, messages: List[Dict]) -> Dict:
+        """Round-robin multi-model call; returns {content, latency_ms,
+        tokens_prompt, tokens_completion}.  Raises ``LLMError`` when every
+        model fails."""
         primary = self._model_idx % len(self.models)
         order = [self.models[(primary + offset) % len(self.models)]
                  for offset in range(len(self.models))]
@@ -211,8 +193,12 @@ class RoundRobinLLMClient:
                     latency_ms = elapsed * 1000.0
                     self._record(model, elapsed)
                     self._last_model = model
-                    return self._parse(content, latency_ms,
-                                       p_tokens, c_tokens)
+                    return {
+                        "content": content,
+                        "latency_ms": round(latency_ms, 2),
+                        "tokens_prompt": p_tokens,
+                        "tokens_completion": c_tokens,
+                    }
                 except LLMError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - SDK raises many types
@@ -224,6 +210,104 @@ class RoundRobinLLMClient:
                     last_error = exc
                     break  # fail over to the next model; noqa: BLE001
         raise LLMError("all models failed: %s" % (last_error or "unknown"))
+
+    def _user_payload(self, metrics: Dict, workload_class: str,
+                      current_policy: str, signals: Optional[Dict] = None,
+                      switch_history: Optional[List[Dict]] = None) -> Dict:
+        """Common telemetry payload for every consult."""
+        payload: Dict = {
+            "current_policy": current_policy or "unknown",
+            "workload_class": workload_class or "unknown",
+            "metrics": {
+                "hit_rate": round(float(metrics.get("hit_rate", 0.0)), 4),
+                "miss_rate": round(float(metrics.get("miss_rate", 0.0)), 4),
+                "hits": int(metrics.get("hits", 0)),
+                "misses": int(metrics.get("misses", 0)),
+                "requests": int(metrics.get("requests", 0)),
+                "total_keys": int(metrics.get("total_keys", 0)),
+            },
+        }
+        if signals:
+            payload["signals"] = signals
+        if switch_history:
+            payload["recent_switches"] = [
+                {"from": h.get("from"), "to": h.get("to"),
+                 "at_request": h.get("at"),
+                 "hit_rate_before": h.get("before"),
+                 "hit_rate_after": h.get("after")}
+                for h in switch_history[-3:]
+            ]
+        return payload
+
+    def decide_policy(
+        self,
+        metrics: Dict,
+        workload_class: str = "",
+        current_policy: str = "",
+        signals: Optional[Dict] = None,
+        switch_history: Optional[List[Dict]] = None,
+    ) -> Dict:
+        """Ask the LLM which eviction policy to run.
+
+        Returns {policy, reason, model_used, latency_ms, tokens_prompt,
+        tokens_completion}.  Raises ``LLMError`` when every model fails or
+        the response is unparseable / names an unknown policy.
+        """
+        if not self.ready:
+            raise LLMError(
+                "no Groq keys in environment (GROQ_API_KEY_1..N not found)"
+            )
+
+        user_content = json.dumps(
+            self._user_payload(metrics, workload_class, current_policy,
+                               signals, switch_history)
+        )
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+        resp = self._chat(messages)
+        return self._parse(resp["content"], resp["latency_ms"],
+                           resp["tokens_prompt"], resp["tokens_completion"])
+
+    def evaluate_switch(
+        self,
+        metrics: Dict,
+        workload_class: str = "",
+        current_policy: str = "",
+        proposed_policy: str = "",
+        signals: Optional[Dict] = None,
+        switch_history: Optional[List[Dict]] = None,
+    ) -> Dict:
+        """Ask the LLM to approve or veto one proposed switch.
+
+        The rule classifier proposes ``proposed_policy``; the LLM's job is
+        risk assessment of that specific switch, not policy picking.  Returns
+        {approve, confidence, reason, model_used, latency_ms, tokens_prompt,
+        tokens_completion}.  Raises ``LLMError`` on transport/parse failure.
+        """
+        if not self.ready:
+            raise LLMError(
+                "no Groq keys in environment (GROQ_API_KEY_1..N not found)"
+            )
+
+        user_content = json.dumps(
+            self._user_payload(metrics, workload_class, current_policy,
+                               signals, switch_history)
+        )
+        user_content = user_content[:-1] + (
+            ', "proposed_policy": %s}' % json.dumps(proposed_policy or "unknown")
+        )
+        messages = [
+            {"role": "system", "content": SWITCH_EVAL_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+        resp = self._chat(messages)
+        return self._parse_switch_eval(
+            resp["content"], resp["latency_ms"],
+            resp["tokens_prompt"], resp["tokens_completion"])
 
     def _parse(self, content: str, latency_ms: float, prompt_tokens: int,
                completion_tokens: int) -> Dict:
@@ -237,6 +321,33 @@ class RoundRobinLLMClient:
             raise LLMError("invalid policy from LLM: %r" % policy)
         return {
             "policy": policy,
+            "reason": str(payload.get("reason", ""))[:120],
+            "model_used": self._last_model,
+            "latency_ms": round(latency_ms, 2),
+            "tokens_prompt": prompt_tokens,
+            "tokens_completion": completion_tokens,
+        }
+
+    def _parse_switch_eval(self, content: str, latency_ms: float,
+                           prompt_tokens: int,
+                           completion_tokens: int) -> Dict:
+        try:
+            payload = json.loads(_extract_json(content))
+        except (ValueError, TypeError) as exc:
+            raise LLMError("unparseable LLM response: %r (%s)"
+                           % (content[:120], exc))
+        approve = payload.get("approve")
+        if isinstance(approve, str):
+            approve = approve.strip().lower() in ("true", "yes", "approve", "1")
+        if not isinstance(approve, bool):
+            raise LLMError("invalid approve value from LLM: %r" % approve)
+        try:
+            confidence = float(payload.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        return {
+            "approve": approve,
+            "confidence": max(0.0, min(1.0, confidence)),
             "reason": str(payload.get("reason", ""))[:120],
             "model_used": self._last_model,
             "latency_ms": round(latency_ms, 2),

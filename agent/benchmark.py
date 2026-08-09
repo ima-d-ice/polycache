@@ -330,9 +330,17 @@ def spawn_agent(cfg):
            "--admin-host", cfg.admin_host, "--admin-port", str(cfg.admin_port),
            "--cooldown", str(cfg.agent_cooldown),
            "--interval", str(cfg.agent_interval),
+           "--decide-every", str(cfg.decide_every),
+           "--cooldown-req", str(cfg.cooldown_req),
            "--access-log", str(cfg.access_log),
-           "--log", str(cfg.agent_log),
-           "--decision-mode", str(cfg.decision_mode)]
+           "--log", str(cfg.agent_log)]
+    if cfg.decision_mode == "hybrid_echo":
+        # Timing control: hybrid logic with a ~0ms mock LLM that always
+        # echoes the rule proposal (identical decisions to rule, identical
+        # consult cadence to hybrid, no Groq keys needed).
+        cmd += ["--decision-mode", "hybrid", "--mock-llm", "echo"]
+    else:
+        cmd += ["--decision-mode", str(cfg.decision_mode)]
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
@@ -640,7 +648,7 @@ def plot_pilot(results, cfg) -> None:
 # A/B comparison: rule vs llm vs hybrid decision modes
 # --------------------------------------------------------------------------
 
-COMPARE_MODES = ("rule", "llm", "hybrid")
+COMPARE_MODES = ("rule", "llm", "hybrid", "hybrid_echo")
 
 
 def _llm_stats(decisions):
@@ -666,18 +674,33 @@ def _llm_stats(decisions):
         "tokens_total": tokens_p + tokens_c,
         "agreement_pct": (round(100.0 * sum(agreements) / len(agreements), 1)
                           if agreements else None),
+        "agreement_list": agreements,
         "models": dict(collections.Counter(d.get("llm_model") for d in ok)),
     }
 
 
-def compare_all(cfg, workload, preload_keys):
-    """Run rule / llm / hybrid back to back, each on a fresh server.
+def _compare_paths(cfg, mode, seed, ext):
+    """Per-mode artifact path for a compare sub-run.
 
-    Every sub-run replays the SAME generated workload: by default all three
+    Multi-seed compares must not reuse AOF/log files across seeds: a
+    replayed AOF silently re-introduces the previous seed's keys.
+    """
+    prefix = ("%s.s%d" % (cfg.aof_prefix, seed)) if seed is not None \
+        else cfg.aof_prefix
+    return Path("%s.compare.%s%s" % (prefix, mode, ext))
+
+
+def compare_all(cfg, workload, preload_keys, seed=None, results_out=None):
+    """Run rule / llm / hybrid / hybrid_echo back to back, fresh server each.
+
+    Every sub-run replays the SAME generated workload: by default all modes
     run the full --requests length so the hit rates are comparable.  An
     explicit --llm-requests cap shrinks the llm/hybrid sub-runs (cheaper
     API spend) but makes the run NOT comparable -- a loud warning is
     printed and flagged in the JSON/report.
+
+    ``seed`` namespaces the per-mode AOF/log artifacts (multi-seed runs).
+    ``results_out`` collects {seed: results} for the aggregation step.
     """
     capped = (cfg.llm_requests > 0 and cfg.llm_requests < cfg.requests)
     if capped:
@@ -688,11 +711,10 @@ def compare_all(cfg, workload, preload_keys):
     results = {}
     for mode in COMPARE_MODES:
         print("\n== compare sub-run: %s ==" % mode)
-        cfg.aof_path = Path("%s.compare.%s.aof" % (cfg.aof_prefix, mode))
-        cfg.server_log = Path("%s.compare.%s.log" % (cfg.aof_prefix, mode))
-        cfg.access_log = Path("%s.compare.%s.access.jsonl" %
-                              (cfg.aof_prefix, mode))
-        cfg.agent_log = "%s.compare.%s.decisions.jsonl" % (cfg.aof_prefix, mode)
+        cfg.aof_path = _compare_paths(cfg, mode, seed, ".aof")
+        cfg.server_log = _compare_paths(cfg, mode, seed, ".log")
+        cfg.access_log = _compare_paths(cfg, mode, seed, ".access.jsonl")
+        cfg.agent_log = str(_compare_paths(cfg, mode, seed, ".decisions.jsonl"))
         # Truncate the per-mode append-only files: a leftover from a previous
         # run/sub-run would pollute the LLM stats and switch log below.
         for path in (cfg.aof_path, cfg.server_log, cfg.access_log,
@@ -736,17 +758,22 @@ def compare_all(cfg, workload, preload_keys):
             ],
         }
 
-    # Multi-model assertion: with 10+ successful LLM decisions at least two
-    # different models must have been consulted (round-robin works).
-    ok_calls = sum(v["llm_stats"]["ok_calls"] for v in results.values())
+    # Multi-model assertion: with 10+ successful real LLM decisions at least
+    # two different models must have been consulted (round-robin works).
+    # The echo client (hybrid_echo timing control) is excluded: it always
+    # answers from "echo-model" and would otherwise mask or fake this check.
+    real_modes = [m for m in ("llm", "hybrid") if m in results]
+    ok_calls = sum(results[m]["llm_stats"]["ok_calls"] for m in real_modes)
     distinct = set()
-    for v in results.values():
-        distinct.update(v["llm_stats"]["models"].keys())
+    for m in real_modes:
+        distinct.update(results[m]["llm_stats"]["models"].keys())
     if ok_calls >= 10 and len(distinct) < 2:
         raise AssertionError(
             "expected >=2 distinct LLM models over %d calls, saw %r"
             % (ok_calls, sorted(distinct)))
 
+    if results_out is not None:
+        results_out[seed] = results
     _plot_compare(results, cfg)
     _dump_compare_json(results, cfg)
     _print_compare_table(results, cfg)
@@ -754,7 +781,7 @@ def compare_all(cfg, workload, preload_keys):
 
 
 def _print_compare_table(results, cfg) -> None:
-    header = ("%-7s | %10s | %8s | %8s | %8s | %9s | %10s | %11s | %16s" %
+    header = ("%-13s | %10s | %8s | %8s | %8s | %9s | %10s | %11s | %16s" %
               ("Mode", "Overall HR", "P1 HR", "P2 HR", "P3 HR", "Switches",
                "LLM Calls", "Fallback %", "Avg LLM Latency"))
     print("\n" + header)
@@ -762,7 +789,7 @@ def _print_compare_table(results, cfg) -> None:
     for mode in COMPARE_MODES:
         v = results[mode]
         ls = v["llm_stats"]
-        print("%-7s | %9.4f | %7.4f | %7.4f | %7.4f | %8d | %9d | %10.1f | %15.2fms"
+        print("%-13s | %9.4f | %7.4f | %7.4f | %7.4f | %8d | %9d | %10.1f | %15.2fms"
               % (mode, v["stats"]["overall"], v["stats"]["phase_rates"][1],
                  v["stats"]["phase_rates"][2], v["stats"]["phase_rates"][3],
                  v["stats"]["switches"], ls["api_calls"], ls["fallback_pct"],
@@ -884,6 +911,189 @@ def _dump_compare_json(results, cfg) -> None:
 
 
 # --------------------------------------------------------------------------
+# Multi-seed aggregation
+# --------------------------------------------------------------------------
+
+def _mean_std(values):
+    """(mean, sample-std, min, max); std 0.0 when n < 2."""
+    values = [float(v) for v in values]
+    n = len(values)
+    mean = sum(values) / n
+    if n < 2:
+        std = 0.0
+    else:
+        var = sum((v - mean) ** 2 for v in values) / (n - 1)
+        std = var ** 0.5
+    return {
+        "mean": round(mean, 4),
+        "std": round(std, 4),
+        "min": round(min(values), 4),
+        "max": round(max(values), 4),
+    }
+
+
+def _aggregate_llm_stats(per_seed_modes):
+    """Merge llm_stats across seeds (calls/tokens sum, latency weighted)."""
+    stats = [m["llm_stats"] for m in per_seed_modes]
+    api = sum(s["api_calls"] for s in stats)
+    ok = sum(s["ok_calls"] for s in stats)
+    fall = sum(s["fallback"] for s in stats)
+    lat = sum(s["avg_latency_ms"] * s["ok_calls"] for s in stats)
+    agreements = [a for s in stats for a in (s.get("agreement_list") or [])]
+    models = collections.Counter()
+    for s in stats:
+        models.update(s["models"])
+    return {
+        "api_calls": api,
+        "ok_calls": ok,
+        "fallback": fall,
+        "fallback_pct": round(100.0 * fall / api, 1) if api else 0.0,
+        "avg_latency_ms": round(lat / ok, 2) if ok else 0.0,
+        "max_latency_ms": round(max((s["max_latency_ms"] for s in stats),
+                                    default=0.0), 2),
+        "tokens_prompt": sum(s["tokens_prompt"] for s in stats),
+        "tokens_completion": sum(s["tokens_completion"] for s in stats),
+        "tokens_total": sum(s["tokens_total"] for s in stats),
+        "agreement_pct": (round(100.0 * sum(agreements) / len(agreements), 1)
+                          if agreements else None),
+        "models": dict(models),
+    }
+
+
+def _aggregate_seeds(per_seed, seeds, cfg):
+    """Mean +/- std across seeds, per-seed winners, honest verdict.
+
+    The verdict demands three things before recommending a mode:
+      1. mean hit-rate gap vs rule >= 1 pt,
+      2. the mode wins on a majority of seeds,
+      3. the timing control (rule vs hybrid_echo) shows gap < 0.5 pt,
+         i.e. identical decisions at identical timing really do measure
+         identically.
+    Otherwise the evidence is inconclusive.
+    """
+    modes = COMPARE_MODES
+    print("\n===== MULTI-SEED SUMMARY (%d seeds: %s) ====="
+          % (len(seeds), ", ".join(str(s) for s in seeds)))
+
+    aggregated = {}
+    for mode in modes:
+        ms = [per_seed[s][mode] for s in seeds]
+        overall = _mean_std([m["stats"]["overall"] for m in ms])
+        phase_rates = {
+            str(ph): _mean_std([m["stats"]["phase_rates"][ph] for m in ms])
+            for ph in (1, 2, 3)
+        }
+        switches = sum(m["stats"]["switches"] for m in ms) / len(ms)
+        llm_stats = _aggregate_llm_stats(ms)
+        aggregated[mode] = {
+            "overall": overall,
+            "phase_rates": phase_rates,
+            "switches": round(switches, 1),
+            "llm_stats": llm_stats,
+        }
+        print("  %-12s overall %.4f +- %.4f | P1 %.4f +- %.4f | "
+              "P2 %.4f +- %.4f | P3 %.4f +- %.4f | switches %.1f"
+              % (mode, overall["mean"], overall["std"],
+                 phase_rates["1"]["mean"], phase_rates["1"]["std"],
+                 phase_rates["2"]["mean"], phase_rates["2"]["std"],
+                 phase_rates["3"]["mean"], phase_rates["3"]["std"],
+                 switches))
+
+    wins = {}
+    for seed in seeds:
+        winner = max(modes, key=lambda m: per_seed[seed][m]["stats"]["overall"])
+        wins[winner] = wins.get(winner, 0) + 1
+    print("\n  per-seed wins:", ", ".join("%s %d" % (m, n)
+                                          for m, n in sorted(wins.items()))
+          if wins else "none")
+
+    rule = aggregated["rule"]
+    echo = aggregated.get("hybrid_echo")
+    echo_gap = abs(echo["overall"]["mean"] - rule["overall"]["mean"]) * 100.0 \
+        if echo else None
+    if echo_gap is not None:
+        print("  timing control: |rule - hybrid_echo| = %.2f pt (must be "
+              "< 0.5 pt)" % echo_gap)
+
+    verdict = {
+        "adopt": None,
+        "gaps_pt": {m: round((aggregated[m]["overall"]["mean"]
+                              - rule["overall"]["mean"]) * 100.0, 2)
+                    for m in modes},
+        "per_seed_wins": wins,
+        "echo_control_gap_pt": round(echo_gap, 2) if echo_gap is not None
+        else None,
+        "text": "",
+    }
+    # Only 'llm' can be adopted: hybrid is diagnostic-only and equals the
+    # rule by construction, so a hybrid "win" is harness noise.
+    candidates = [m for m in ("llm",)
+                  if verdict["gaps_pt"][m] >= 1.0
+                  and wins.get(m, 0) > len(seeds) / 2]
+    control_ok = echo_gap is None or echo_gap < 0.5
+    if candidates and control_ok:
+        verdict["adopt"] = max(candidates,
+                               key=lambda m: verdict["gaps_pt"][m])
+        verdict["text"] = ("Adopt **%s**: +%.1f pt vs rule mean, wins on "
+                           "%d/%d seeds, timing control clean (%.2f pt)."
+                           % (verdict["adopt"],
+                              verdict["gaps_pt"][verdict["adopt"]],
+                              wins.get(verdict["adopt"], 0), len(seeds),
+                              verdict["echo_control_gap_pt"] or 0.0))
+    elif not control_ok and echo_gap is not None:
+        verdict["text"] = ("**INCONCLUSIVE -- HARNESS FAILED CONTROL.** "
+                           "rule vs hybrid_echo differ by %.2f pt (>= 0.5), "
+                           "so hit-rate gaps between modes cannot be "
+                           "attributed to the decision logic." % echo_gap)
+    else:
+        verdict["text"] = ("**INCONCLUSIVE.** No mode beats rule by >= 1 pt "
+                           "on a majority of seeds (gaps: %s). Use rule."
+                           % ", ".join("%s %+.1f" % (m, g)
+                                       for m, g in verdict["gaps_pt"].items()
+                                       if m != "rule"))
+    print("\n  VERDICT: %s\n" % verdict["text"])
+
+    payload = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "config": {
+            "requests": cfg.requests,
+            "llm_requests": cfg.llm_requests,
+            "capped": cfg.llm_requests > 0
+            and cfg.llm_requests < cfg.requests,
+            "working_set": cfg.working_set,
+            "cache_size_mb": cfg.cache_size_mb,
+            "value_size": cfg.value_size,
+            "seed": getattr(cfg, "seed", None),
+            "hot_size": cfg.hot_size,
+            "burst_size": cfg.burst_size,
+            "scan_size": cfg.scan_size,
+        },
+        "seeds": list(seeds),
+        "seeds_n": len(seeds),
+        "per_seed": {
+            str(seed): {
+                mode: {
+                    "requests": per_seed[seed][mode]["requests"],
+                    "overall": per_seed[seed][mode]["stats"]["overall"],
+                    "phase_rates": per_seed[seed][mode]["stats"]["phase_rates"],
+                    "switches": per_seed[seed][mode]["stats"]["switches"],
+                    "switch_log": per_seed[seed][mode]["switches"],
+                    "llm_stats": per_seed[seed][mode]["llm_stats"],
+                }
+                for mode in modes
+            }
+            for seed in seeds
+        },
+        "aggregated": aggregated,
+        "verdict": verdict,
+    }
+    out = "%scompare_results.json" % cfg.plot_prefix
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    print("saved %s (multi-seed aggregated)" % out)
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -928,6 +1138,11 @@ def main(argv=None) -> int:
     parser.add_argument("--admin-host", default="localhost")
     parser.add_argument("--admin-port", type=int, default=8080)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--seeds", type=int, nargs="+", default=None,
+                        help="compare across multiple seeds (e.g. --seeds 1 7 "
+                             "42 123 999): per-seed compare runs, then an "
+                             "aggregated mean +- std verdict.  Defaults to a "
+                             "single seed (--seed or 7).")
     parser.add_argument("--server-path", default=str(SCRIPT_DIR.parent / "adaptivecache"))
     parser.add_argument("--aof-prefix", default="/tmp/adaptivecache_bench")
     parser.add_argument("--wait-timeout", type=float, default=10.0)
@@ -937,13 +1152,27 @@ def main(argv=None) -> int:
                         help="start agent.py for the pilot mode")
     parser.add_argument("--agent-cooldown", type=float, default=1.0)
     parser.add_argument("--agent-interval", type=float, default=1.0)
+    parser.add_argument("--decide-every", type=int, default=5000,
+                        help="agent decides at fixed workload positions "
+                             "(every N requests, counted from the access "
+                             "telemetry) instead of wall-clock intervals -- "
+                             "removes run-to-run timing jitter so compare "
+                             "sub-runs measure identically (0 = wall-clock)")
+    parser.add_argument("--cooldown-req", type=int, default=12000,
+                        help="agent post-switch cooldown in requests (0 = "
+                             "use --agent-cooldown seconds).  Default > "
+                             "--decide-every so the cooldown actually "
+                             "throttles: a switch can be undone at most "
+                             "every ~2-3 decisions.")
     parser.add_argument("--decision-mode", default="rule",
                         choices=("rule", "llm", "hybrid"),
                         help="agent decision mode for the pilot / compare "
                              "sub-runs (default rule)")
     parser.add_argument("--compare", action="store_true",
-                        help="A/B run: rule -> llm -> hybrid on fresh "
-                             "servers, then comparison plots + JSON")
+                        help="A/B run: rule -> llm -> hybrid -> hybrid_echo "
+                             "on fresh servers, then comparison plots + JSON. "
+                             "With --seeds the comparison repeats per seed "
+                             "and aggregates mean +/- std.")
     parser.add_argument("--llm-requests", type=int, default=0,
                         help="cap the llm/hybrid compare sub-runs to this "
                              "many requests (0 = same as --requests, the "
@@ -1020,7 +1249,21 @@ def main(argv=None) -> int:
     telemetry_fh = None
     try:
         if args.compare:
-            compare_all(args, workload, preload_keys)
+            seeds = list(args.seeds) if args.seeds \
+                else [args.seed if args.seed is not None else 7]
+            per_seed = {}
+            for seed in seeds:
+                seed_rng = random.Random(seed)
+                seed_keys = _key_names(args.working_set)
+                seed_rng.shuffle(seed_keys)
+                seed_workload = build_workload(seed_keys, args.requests,
+                                               seed_rng, args)
+                print("\n===== compare seed %d (%d seeds planned) ====="
+                      % (seed, len(seeds)))
+                compare_all(args, seed_workload, seed_keys, seed=seed,
+                            results_out=per_seed)
+            if len(seeds) > 1:
+                _aggregate_seeds(per_seed, seeds, args)
             return 0
         for mode in modes:
             print("\n== mode %s ==" % mode)

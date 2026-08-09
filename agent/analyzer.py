@@ -101,3 +101,27 @@ class WorkloadAnalyzer:
         if high_churn and not steady:
             return "bursty"
         return "stable"
+
+    def rule_confidence(self, workload: str, zipf: float = 0.0,
+                        scan_ratio: float = 0.0) -> float:
+        """How far the dominant signal sits from its threshold (0..1).
+
+        1.0 = far past the threshold (confident classification), ~0.5 =
+        right at the threshold (noisy).  Used to gate LLM consults in
+        hybrid mode: the LLM only weighs in on uncertain proposals.
+        """
+        churn = self.compute_churn_rate()
+        if workload == "scanning":
+            return min(1.0, scan_ratio / self.SCAN_RATIO)
+        if workload == "skewed":
+            return min(1.0, zipf / self.SKEW_ZIPF)
+        if workload == "bursty":
+            if churn <= 0:
+                return 0.5
+            return min(1.0, churn / self.HIGH_CHURN_PER_WINDOW)
+        # stable: confident when NOT near any other classification threshold.
+        return max(0.0, 1.0 - max(
+            scan_ratio / self.SCAN_RATIO,
+            zipf / self.SKEW_ZIPF,
+            (churn / self.HIGH_CHURN_PER_WINDOW if churn > 0 else 0.0),
+        ))

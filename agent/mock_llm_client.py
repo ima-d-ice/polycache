@@ -27,6 +27,8 @@ class MockLLMClient(RoundRobinLLMClient):
     def __init__(
         self,
         policy: str = "sieve",
+        approve: bool = True,
+        confidence: float = 0.9,
         fail_models: Optional[List[str]] = None,
         retry_models: Optional[List[str]] = None,
         bad_models: Optional[List[str]] = None,
@@ -40,6 +42,8 @@ class MockLLMClient(RoundRobinLLMClient):
             **kwargs
         )
         self.policy = policy
+        self.approve = approve
+        self.confidence = confidence
         self.fail_models = set(fail_models or [])
         self.retry_models = set(retry_models or [])
         self.bad_models = set(bad_models or [])
@@ -56,9 +60,18 @@ class MockLLMClient(RoundRobinLLMClient):
             raise _FakeRateLimit("mock %s: rate limited" % short)
         if short in self.bad_models:
             return "not-json-at-all", 240, 18
-        content = json.dumps(
-            {"policy": self.policy, "reason": "mock decision"}
-        )
+        if any(m.get("role") == "system"
+               and "risk assessor" in m.get("content", "")
+               for m in messages):
+            content = json.dumps(
+                {"approve": self.approve,
+                 "confidence": self.confidence,
+                 "reason": "mock switch eval"}
+            )
+        else:
+            content = json.dumps(
+                {"policy": self.policy, "reason": "mock decision"}
+            )
         return content, 240, 18
 
 
@@ -113,25 +126,48 @@ def self_check() -> None:
     assert stats["llama-3.3-70b-versatile"]["calls"] == 2, stats
     assert stats["gpt-oss-120b"]["errors"] == 1, stats
 
-    # 9. No keys -> inits cleanly, decide_policy raises.
+    # 9. No keys -> inits cleanly, decide_policy and evaluate_switch raise.
     import os
     saved = {name: os.environ.pop(name) for name in list(os.environ)
              if name.startswith("GROQ_API_KEY")}
     try:
         nk = RoundRobinLLMClient(keys=[])
         assert nk.ready is False
-        try:
-            nk.decide_policy({}, "", "")
-        except LLMError:
-            pass
-        else:
-            raise AssertionError("no-keys: expected LLMError")
+        for call in (lambda: nk.decide_policy({}, "", ""),
+                     lambda: nk.evaluate_switch({}, "", "", "sieve")):
+            try:
+                call()
+            except LLMError:
+                pass
+            else:
+                raise AssertionError("no-keys: expected LLMError")
     finally:
         for name, value in saved.items():
             if value is not None:
                 os.environ[name] = value
 
-    print("mock_llm_client.self_check: all 9 assertions passed")
+    # 10. evaluate_switch returns approve/confidence, rotates models.
+    e = MockLLMClient()
+    ev = e.evaluate_switch({"hit_rate": 0.4}, "bursty", "lfu", "sieve")
+    assert ev["approve"] is True and ev["confidence"] == 0.9, ev
+    assert ev["model_used"] in MODELS, ev
+
+    # 11. Veto client: approve=False parses and returns cleanly.
+    v = MockLLMClient(approve=False, confidence=0.6)
+    ev2 = v.evaluate_switch({"hit_rate": 0.4}, "bursty", "lfu", "sieve")
+    assert ev2["approve"] is False and ev2["confidence"] == 0.6, ev2
+
+    # 12. Garbage switch-eval response -> LLMError (bad model responds to
+    # both prompt shapes with garbage).
+    bad_eval = MockLLMClient(bad_models=["gpt-oss-120b"])
+    try:
+        bad_eval.evaluate_switch({"hit_rate": 0.4}, "bursty", "lfu", "sieve")
+    except LLMError:
+        pass
+    else:
+        raise AssertionError("bad-switch-eval: expected LLMError")
+
+    print("mock_llm_client.self_check: all 12 assertions passed")
 
 
 if __name__ == "__main__":
