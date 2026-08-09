@@ -339,8 +339,18 @@ def spawn_agent(cfg):
         # echoes the rule proposal (identical decisions to rule, identical
         # consult cadence to hybrid, no Groq keys needed).
         cmd += ["--decision-mode", "hybrid", "--mock-llm", "echo"]
+    elif cfg.decision_mode == "hybrid_conflict_echo":
+        # Timing control for hybrid_conflict: echo sides with the rule in
+        # every arbitration, so decisions equal rule's exactly.
+        cmd += ["--decision-mode", "hybrid_conflict", "--mock-llm", "echo"]
     else:
         cmd += ["--decision-mode", str(cfg.decision_mode)]
+    if cfg.decision_mode in ("hybrid_conflict", "hybrid_conflict_echo"):
+        # Eviction-physics context: exact preload numbers so the agent's
+        # deterministic burst-pool signal can compute survival ETA.
+        cap = cache_capacity(cfg.cache_size_mb, cfg.value_size)
+        cmd += ["--capacity-keys", str(cap),
+                "--burst-keys", str(cfg.burst_size)]
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
@@ -648,7 +658,8 @@ def plot_pilot(results, cfg) -> None:
 # A/B comparison: rule vs llm vs hybrid decision modes
 # --------------------------------------------------------------------------
 
-COMPARE_MODES = ("rule", "llm", "hybrid", "hybrid_echo")
+COMPARE_MODES = ("rule", "llm", "hybrid", "hybrid_conflict",
+                 "hybrid_echo", "hybrid_conflict_echo")
 
 
 def _llm_stats(decisions):
@@ -661,6 +672,7 @@ def _llm_stats(decisions):
     tokens_p = sum(int(d.get("llm_tokens_prompt", 0) or 0) for d in ok)
     tokens_c = sum(int(d.get("llm_tokens_completion", 0) or 0) for d in ok)
     agreements = [int(d.get("agreement", -1)) for d in ok if "agreement" in d]
+    arbiter_lines = [d for d in ok if d.get("role") == "arbiter"]
     return {
         "api_calls": len(llm_lines),
         "ok_calls": len(ok),
@@ -675,6 +687,8 @@ def _llm_stats(decisions):
         "agreement_pct": (round(100.0 * sum(agreements) / len(agreements), 1)
                           if agreements else None),
         "agreement_list": agreements,
+        "arbiter_calls": len(arbiter_lines),
+        "arbiter_picks": [d.get("llm_policy") for d in arbiter_lines],
         "models": dict(collections.Counter(d.get("llm_model") for d in ok)),
     }
 
@@ -956,6 +970,9 @@ def _aggregate_llm_stats(per_seed_modes):
         "tokens_total": sum(s["tokens_total"] for s in stats),
         "agreement_pct": (round(100.0 * sum(agreements) / len(agreements), 1)
                           if agreements else None),
+        "arbiter_calls": sum(s.get("arbiter_calls", 0) for s in stats),
+        "arbiter_picks": [p for s in stats
+                          for p in (s.get("arbiter_picks") or [])],
         "models": dict(models),
     }
 
@@ -1121,17 +1138,29 @@ def main(argv=None) -> int:
                         help="burst pool read at each phase start, then "
                              "idle; past the LRU horizon LRU drops these "
                              "keys, LFU/SIEVE keep them")
-    parser.add_argument("--cold-ratio", type=float, default=0.50,
+    parser.add_argument("--cold-ratio", type=float, default=None,
                         help="share of phase-1 (and the phase-3 first-half) "
                              "requests that SET a brand-new key never read "
                              "again.  Each SET evicts one key, so this is the "
                              "churn that must blow the eviction frontier past "
                              "the burst pool within a phase (>= capacity / "
-                             "phase length keeps it honest)")
-    parser.add_argument("--scan-write-ratio", type=float, default=0.50,
+                             "phase length keeps it honest).  Default 0.50 "
+                             "(0.30 with --churn-regime moderate)")
+    parser.add_argument("--scan-write-ratio", type=float, default=None,
                         help="analogous churn for phase 2 / phase-3 second "
                              "half; the remaining requests split 50/50 between "
-                             "hot zipfian GETs and the resident scan")
+                             "hot zipfian GETs and the resident scan.  "
+                             "Default 0.50 (0.30 with --churn-regime moderate)")
+    parser.add_argument("--churn-regime", default="adversarial",
+                        choices=("adversarial", "moderate"),
+                        help="adversarial = 0.50/0.50 cold+scan churn (the "
+                             "verified-divergence config that saturates the "
+                             "rule classifier's confidence); moderate = "
+                             "0.30/0.30 churn just above the divergence "
+                             "floor, where the rule's signals stay near "
+                             "their decision boundaries and genuine "
+                             "rule-vs-physics ambiguity can occur.  Explicit "
+                             "--cold-ratio/--scan-write-ratio override it.")
     parser.add_argument("--block-size", type=int, default=1000)
     parser.add_argument("--cache-host", default="localhost")
     parser.add_argument("--cache-port", type=int, default=6379)
@@ -1165,7 +1194,7 @@ def main(argv=None) -> int:
                              "throttles: a switch can be undone at most "
                              "every ~2-3 decisions.")
     parser.add_argument("--decision-mode", default="rule",
-                        choices=("rule", "llm", "hybrid"),
+                        choices=("rule", "llm", "hybrid", "hybrid_conflict"),
                         help="agent decision mode for the pilot / compare "
                              "sub-runs (default rule)")
     parser.add_argument("--compare", action="store_true",
@@ -1191,6 +1220,14 @@ def main(argv=None) -> int:
     if args.alpha <= 0:
         print("--alpha must be > 0", file=sys.stderr)
         return 1
+    # Churn regime defaults: adversarial = verified-divergence 0.50/0.50;
+    # moderate = gentler churn where the rule's signals stay near their
+    # thresholds (the regime where rule-vs-physics conflict can occur).
+    if args.cold_ratio is None:
+        args.cold_ratio = 0.50 if args.churn_regime == "adversarial" else 0.30
+    if args.scan_write_ratio is None:
+        args.scan_write_ratio = (0.50 if args.churn_regime == "adversarial"
+                                 else 0.30)
     if not (0.0 <= args.cold_ratio < 1.0 and
             0.0 <= args.scan_write_ratio < 1.0):
         print("--cold-ratio/--scan-write-ratio must be in [0, 1)",

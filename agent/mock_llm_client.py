@@ -29,6 +29,7 @@ class MockLLMClient(RoundRobinLLMClient):
         policy: str = "sieve",
         approve: bool = True,
         confidence: float = 0.9,
+        trust: str = "physics",
         fail_models: Optional[List[str]] = None,
         retry_models: Optional[List[str]] = None,
         bad_models: Optional[List[str]] = None,
@@ -44,6 +45,7 @@ class MockLLMClient(RoundRobinLLMClient):
         self.policy = policy
         self.approve = approve
         self.confidence = confidence
+        self.trust = trust
         self.fail_models = set(fail_models or [])
         self.retry_models = set(retry_models or [])
         self.bad_models = set(bad_models or [])
@@ -67,6 +69,14 @@ class MockLLMClient(RoundRobinLLMClient):
                 {"approve": self.approve,
                  "confidence": self.confidence,
                  "reason": "mock switch eval"}
+            )
+        elif any(m.get("role") == "system"
+                 and "arbiter" in m.get("content", "")
+                 for m in messages):
+            content = json.dumps(
+                {"policy": self.policy, "trust": self.trust,
+                 "confidence": self.confidence,
+                 "reason": "mock arbitration"}
             )
         else:
             content = json.dumps(
@@ -167,7 +177,36 @@ def self_check() -> None:
     else:
         raise AssertionError("bad-switch-eval: expected LLMError")
 
-    print("mock_llm_client.self_check: all 12 assertions passed")
+    # 13. arbitrate_conflict: sides with rule, parses trust/confidence,
+    # and rejects a policy outside {current, rule, physics}.
+    a = MockLLMClient(policy="sieve", trust="rule", confidence=0.7)
+    arb = a.arbitrate_conflict({"hit_rate": 0.4}, "bursty", "lfu",
+                               "sieve", "lru")
+    assert arb["policy"] == "sieve", arb
+    assert arb["trust"] == "rule" and arb["confidence"] == 0.7, arb
+    assert arb["model_used"] in MODELS, arb
+    bad_arb = MockLLMClient(policy="lfu")  # lfu is current -> allowed
+    arb2 = bad_arb.arbitrate_conflict({"hit_rate": 0.4}, "bursty", "lfu",
+                                      "sieve", "lru")
+    assert arb2["policy"] == "lfu", arb2
+    bad_arb.policy = "fifo"
+    try:
+        bad_arb.arbitrate_conflict({"hit_rate": 0.4}, "bursty", "lfu",
+                                   "sieve", "lru")
+    except LLMError:
+        pass
+    else:
+        raise AssertionError("bad-arbitration: expected LLMError")
+    bad_trust = MockLLMClient(policy="sieve", trust="whimsy")
+    try:
+        bad_trust.arbitrate_conflict({"hit_rate": 0.4}, "bursty", "lfu",
+                                     "sieve", "lru")
+    except LLMError:
+        pass
+    else:
+        raise AssertionError("bad-trust: expected LLMError")
+
+    print("mock_llm_client.self_check: all 13 assertions passed")
 
 
 if __name__ == "__main__":

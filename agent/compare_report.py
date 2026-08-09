@@ -25,7 +25,8 @@ PRICING = {
 }
 DEFAULT_PRICE = 0.20
 
-MODES = ("rule", "llm", "hybrid", "hybrid_echo")
+MODES = ("rule", "llm", "hybrid", "hybrid_conflict",
+         "hybrid_echo", "hybrid_conflict_echo")
 
 
 def _fmt_pct(value, digits=1):
@@ -301,11 +302,14 @@ def build_report(data: dict, results_path: Path) -> str:
         "",
     ]
 
-    # Agreement analysis (hybrid).
+    # Agreement analysis (hybrid) + arbitration analysis (hybrid_conflict).
     hyb_agreement = hyb_stats.get("agreement_pct")
     hyb_calls = hyb_stats.get("api_calls", 0)
+    conf_stats = llm_stats("hybrid_conflict")
+    conf_calls = conf_stats.get("arbiter_calls", 0)
+    conf_picks = conf_stats.get("arbiter_picks") or []
     lines += [
-        "## Agreement Analysis (hybrid)",
+        "## Agreement & Arbitration Analysis (hybrid modes)",
         "",
         "Hybrid is **diagnostic-only**: the rule proposes a switch and the "
         "LLM assesses it (approve/confidence/reason) on proposals; the rule "
@@ -317,6 +321,14 @@ def build_report(data: dict, results_path: Path) -> str:
            else "n/a (no consults)"),
         "- Echo control agreement: %s (by construction)."
         % _fmt_pct(echo_stats.get("agreement_pct")),
+        "",
+        "`hybrid_conflict` adds a deterministic eviction-physics signal "
+        "(burst-pool survival eta).  The LLM is consulted ONLY when the "
+        "physics proposal and the rule proposal disagree, and its pick "
+        "executes there (scoped veto).",
+        "",
+        "- Rule/physics conflicts arbitrated: %d (picks: %s)."
+        % (conf_calls, ", ".join(str(p) for p in conf_picks) or "none"),
         "",
     ]
 
@@ -332,7 +344,10 @@ def build_report(data: dict, results_path: Path) -> str:
             "",
             "- **Design (final)**: `hybrid` is diagnostic-only -- the rule "
             "proposes, the LLM assesses, the rule decides; `llm` mode is "
-            "deprecated.  Three controlled experiments led here:",
+            "deprecated.  `hybrid_conflict` (the follow-up experiment) gives "
+            "the LLM a scoped veto ONLY when a deterministic eviction-physics "
+            "signal and the rule disagree.  Three controlled experiments led "
+            "here:",
             "- **(1) Un-gated consults**: the LLM vetoed the pre-workload "
             "lru->lfu switch with \"no activity, keep current stable "
             "policy\" and P1 collapsed (overall -30 to -41 pt at every "

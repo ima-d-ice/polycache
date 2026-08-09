@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from analyzer import WorkloadAnalyzer
+from analyzer import WorkloadAnalyzer, physics_proposal
 from metrics import compute_zipf_coefficient, detect_scan_pattern, fetch_metrics
 from llm_client import LLMError, RoundRobinLLMClient
 
@@ -28,7 +28,7 @@ POLICY_FOR_WORKLOAD = {
     "bursty": "sieve",
 }
 
-DECISION_MODES = ("rule", "llm", "hybrid")
+DECISION_MODES = ("rule", "llm", "hybrid", "hybrid_conflict")
 
 
 class AgentState(TypedDict, total=False):
@@ -62,6 +62,8 @@ class TuningAgent:
         mock_llm: Optional[str] = None,
         decide_every_requests: int = 0,
         cooldown_requests: int = 0,
+        capacity_keys: int = 0,
+        burst_keys: int = 0,
     ) -> None:
         self.cache_host = cache_host
         self.cache_port = cache_port
@@ -70,6 +72,13 @@ class TuningAgent:
         self.cooldown_seconds = cooldown_seconds
         self.rollback_drop = rollback_drop
         self.hybrid_disagreement = hybrid_disagreement
+
+        # Eviction-physics context for the deterministic burst-pool signal
+        # (hybrid_conflict mode).  The benchmark passes the exact numbers
+        # it preloaded: cache capacity in keys and the burst pool size.
+        # 0 = unknown -> the physics classifier stays silent.
+        self.capacity_keys = max(0, int(capacity_keys))
+        self.burst_keys = max(0, int(burst_keys))
 
         # Request-quantized cadence (deterministic benchmark mode): when
         # decide_every_requests > 0 the agent decides at fixed workload
@@ -300,7 +309,7 @@ class TuningAgent:
         zipf = float(state.get("zipf", 0.0))
         scan_ratio = float(state.get("scan_ratio", 0.0))
         workload = str(state.get("workload", ""))
-        return {
+        signals: Dict = {
             "zipf": round(zipf, 3),
             "scan_ratio": round(scan_ratio, 3),
             "churn_rate": round(self.analyzer.compute_churn_rate(), 2),
@@ -309,6 +318,30 @@ class TuningAgent:
             "rule_confidence": round(
                 self.analyzer.rule_confidence(workload, zipf, scan_ratio), 2),
         }
+        physics = self._physics_signal(state)
+        if physics[0] is not None:
+            _, eta_requests, frontier = physics
+            signals["frontier_progress"] = frontier
+            signals["burst_pool_survival_eta"] = eta_requests
+            signals["decide_every"] = self.decide_every
+        return signals
+
+    def _physics_signal(self, state: AgentState) -> tuple:
+        """(proposal, eta_requests, frontier_progress) from eviction physics.
+
+        Deterministic, no LLM.  ``proposal`` is "sieve" when the eviction
+        frontier is predicted to breach the burst pool within one decision
+        window (leading preemptive trigger), else None.  Silent when the
+        benchmark did not pass capacity/burst context or there is no churn.
+        """
+        if self.capacity_keys <= 0 or self.burst_keys <= 0:
+            return None, None, None
+        metrics = state.get("metrics", {})
+        evictions = int(metrics.get("evictions", 0))
+        churn = self.analyzer.compute_churn_rate()
+        return physics_proposal(
+            evictions, churn, self.capacity_keys, self.burst_keys,
+            max(self.decide_every, 1))
 
     def _recent_switch_history(self) -> List[Dict]:
         return list(self._switch_history)[-3:]
@@ -377,6 +410,65 @@ class TuningAgent:
         self._log_decision(payload)
         self._llm_cache[cache_key] = eval_res
         return eval_res
+
+    def _llm_arbitrate(
+        self, state: AgentState, current: str, rule_target: str,
+        physics_target: str
+    ) -> Optional[Dict]:
+        """hybrid_conflict consult: the rule and the eviction-physics signal
+        propose different actions; ask the LLM to pick one (real veto power,
+        scoped to this engineered disagreement).
+
+        Cached per (workload_class, rule_target, physics_target).  Returns
+        the arbitration dict or None on failure (the rule proposal then
+        executes unchanged -- fail-safe by construction).  Always logs a
+        ``kind:"llm"`` entry with role "arbiter" and the conflict fields.
+        """
+        llm = self._llm
+        if llm is None:
+            return None
+        workload = str(state.get("workload", ""))
+        cache_key = ("conflict", workload, rule_target, physics_target)
+        if cache_key in self._llm_cache:
+            return self._llm_cache[cache_key]
+        signals = self._llm_signals(state)
+        payload = {
+            "kind": "llm",
+            "role": "arbiter",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "current_policy": current,
+            "workload_class": workload,
+            "rule_policy": rule_target,
+            "physics_policy": physics_target,
+            "signals": signals,
+            "metrics_snapshot": self._snapshot(state),
+        }
+        try:
+            arb = llm.arbitrate_conflict(
+                state.get("metrics", {}), workload, current,
+                rule_target, physics_target,
+                signals=signals,
+                switch_history=self._recent_switch_history())
+        except LLMError as exc:
+            payload.update({"llm_policy": None, "fallback": True})
+            self._log_decision(payload)
+            self.logger.warning(
+                "LLM arbitration failed, rule proposal proceeds (%s)", exc)
+            return None
+        payload.update({
+            "llm_policy": arb["policy"],
+            "llm_trust": arb.get("trust", ""),
+            "llm_confidence": arb.get("confidence", 0.0),
+            "llm_reason": arb.get("reason", ""),
+            "llm_model": arb["model_used"],
+            "llm_latency_ms": arb["latency_ms"],
+            "llm_tokens_prompt": arb["tokens_prompt"],
+            "llm_tokens_completion": arb["tokens_completion"],
+            "fallback": False,
+        })
+        self._log_decision(payload)
+        self._llm_cache[cache_key] = arb
+        return arb
 
     # -------------------------------------------------------------- nodes
 
@@ -480,12 +572,61 @@ class TuningAgent:
                         "resolution": "rule",
                     }
                 # else: consult failed -> rule proposal executes unchanged.
+        elif self.decision_mode == "hybrid_conflict":
+            # Deterministic physics + LLM arbitration of genuine conflicts.
+            # The eviction-physics signal (burst pool survival eta) proposes
+            # independently from the statistical rule.  Agreement (or a
+            # silent physics signal) executes with 0 LLM calls -- the common
+            # case.  Only a real rule-vs-physics disagreement routes to the
+            # LLM, and THERE the arbiter's pick actually executes (scoped
+            # veto power in the one place ambiguity was engineered).  A
+            # failed consult falls back to the rule proposal -- fail-safe
+            # by construction.
+            physics_target, eta_requests, frontier = self._physics_signal(
+                state)
+            rule_switch = target if (target and target != current) else None
+            if physics_target is None or physics_target == rule_switch:
+                pass  # agreement or no physics signal: rule executes
+            elif cooldown_ok and has_evidence:
+                arb = self._llm_arbitrate(state, current,
+                                          rule_switch or current,
+                                          physics_target)
+                if arb is not None:
+                    arb_policy = str(arb.get("policy", ""))
+                    hybrid_detail = {
+                        "rule_proposal": rule_switch or current,
+                        "physics_proposal": physics_target,
+                        "physics_eta_requests": eta_requests,
+                        "physics_frontier": frontier,
+                        "llm_policy": arb_policy,
+                        "llm_trust": arb.get("trust", ""),
+                        "llm_confidence": arb.get("confidence", 0.0),
+                        "resolution": "arbitrated",
+                    }
+                    if arb_policy != current:
+                        target = arb_policy
+                    else:
+                        target = current
+                # else: arbitration failed -> rule proposal executes.
+            # else (physics disagrees but cooldown/evidence blocks the
+            # consult): rule proposal executes unchanged.
         if target and target != current:
             if cooldown_ok:
                 if self.decision_mode == "llm" and llm_pick is not None:
                     reason = ("llm[%s] chose %s: %s"
                               % (llm_pick["model_used"], target,
                                  llm_pick.get("reason", "") or "no reason"))
+                elif hybrid_detail is not None and "llm_trust" in hybrid_detail:
+                    reason = (
+                        "hybrid_conflict[%s]: rule=%s physics=%s llm=%s "
+                        "trust=%s conf=%.2f final=%s"
+                        % (hybrid_detail["resolution"],
+                           hybrid_detail["rule_proposal"],
+                           hybrid_detail["physics_proposal"],
+                           hybrid_detail["llm_policy"],
+                           hybrid_detail["llm_trust"],
+                           hybrid_detail["llm_confidence"], target)
+                    )
                 elif hybrid_detail is not None:
                     reason = (
                         "hybrid[%s]: rule->%s llm_approve=%s conf=%.2f "
@@ -623,13 +764,21 @@ class TuningAgent:
                         dec.get("new_policy", "?"),
                         dec.get("reason", ""),
                     )
-                self._log_decision({
+                cycle_entry = {
                     "kind": "cycle",
                     "action": str(result.get("action", "?")),
                     "progress": self._progress,
                     "desired_policy": str(result.get("desired_policy", "")),
                     "reason": str(result.get("reason", "")),
-                })
+                }
+                if self.decision_mode == "hybrid_conflict":
+                    # Expose the physics signal at every cycle so conflict
+                    # rate and trigger timing are audit-able offline.
+                    physics = self._physics_signal(result)
+                    cycle_entry["physics_proposal"] = physics[0]
+                    cycle_entry["physics_eta_requests"] = physics[1]
+                    cycle_entry["physics_frontier"] = physics[2]
+                self._log_decision(cycle_entry)
             except Exception as exc:  # keep the loop alive
                 self.logger.error("cycle failed: %s", exc)
             if self.decide_every > 0:
@@ -679,8 +828,20 @@ def main() -> None:
                              "decides, LLM consulted on proposals as a "
                              "diagnostic annotator (recommended for "
                              "experimentation; ~0 steady-state latency); "
-                             "llm = LLM chooses the policy (DEPRECATED: "
-                             "lost to rule in controlled experiments)")
+                             "hybrid_conflict = rule + deterministic "
+                             "eviction-physics signal; LLM arbitrates only "
+                             "when they disagree (the experiment under "
+                             "test); llm = LLM chooses the policy "
+                             "(DEPRECATED: lost to rule in controlled "
+                             "experiments)")
+    parser.add_argument("--capacity-keys", type=int, default=0,
+                        help="cache capacity in keys (benchmark preload "
+                             "count).  Enables the eviction-physics signal "
+                             "used by hybrid_conflict (0 = disabled)")
+    parser.add_argument("--burst-keys", type=int, default=0,
+                        help="burst pool size in keys (preload tail).  "
+                             "Enables the eviction-physics signal used by "
+                             "hybrid_conflict (0 = disabled)")
     parser.add_argument("--hybrid-disagreement", default="stay",
                         choices=("stay", "rule", "llm"),
                         help="DEPRECATED no-op: hybrid is diagnostic-only, "
@@ -705,6 +866,8 @@ def main() -> None:
         mock_llm=args.mock_llm,
         decide_every_requests=args.decide_every,
         cooldown_requests=args.cooldown_req,
+        capacity_keys=args.capacity_keys,
+        burst_keys=args.burst_keys,
     )
     try:
         agent.run(args.interval, args.cycles)

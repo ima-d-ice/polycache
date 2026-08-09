@@ -20,6 +20,42 @@ def _least_squares_slope(y: List[float]) -> float:
     return sum((x - x_mean) * (yi - y_mean) for x, yi in zip(xs, y)) / denom
 
 
+def physics_proposal(
+    evictions_so_far: int,
+    churn_per_window: float,
+    capacity_keys: int,
+    burst_keys: int,
+    decide_every: int = 5000,
+) -> tuple:
+    """Deterministic eviction-physics signal: is the burst pool at risk?
+
+    Under cold churn every policy's eviction frontier walks the preload
+    insertion order, so the burst pool (the last ``burst_keys`` inserted
+    keys) is doomed once ``evictions_so_far`` approaches
+    ``capacity_keys - burst_keys``.  This computes how far the frontier is
+    from the pool (in evictions) and when it will get there (in requests,
+    from the churn rate), turning that into a leading preemptive proposal.
+
+    Returns ``(proposal, eta_requests, frontier_progress)`` where
+    ``proposal`` is ``"sieve"`` when the pool will be breached before the
+    next decision window (``eta < decide_every``) and ``None`` otherwise
+    (no signal / too late to matter / physics unavailable).
+    """
+    if (capacity_keys <= 0 or burst_keys <= 0
+            or burst_keys >= capacity_keys or churn_per_window <= 0
+            or evictions_so_far < 0):
+        return None, None, None
+    pool_offset = capacity_keys - burst_keys
+    frontier = evictions_so_far / capacity_keys
+    remaining = pool_offset - evictions_so_far
+    if remaining <= 0:
+        # Frontier already in the pool: switching now cannot save it.
+        return None, 0.0, round(frontier, 3)
+    eta_requests = remaining * decide_every / churn_per_window
+    proposal = "sieve" if eta_requests < decide_every else None
+    return proposal, round(eta_requests, 1), round(frontier, 3)
+
+
 class WorkloadAnalyzer:
     """Sliding-window analysis of AdaptiCache metric snapshots.
 

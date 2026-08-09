@@ -52,3 +52,23 @@ class EchoLLMClient(RoundRobinLLMClient):
             "tokens_prompt": 0,
             "tokens_completion": 0,
         }
+
+    def arbitrate_conflict(self, metrics: Dict, workload_class: str = "",
+                           current_policy: str = "",
+                           rule_proposed_policy: str = "",
+                           physics_proposed_policy: str = "",
+                           signals: Dict = None,
+                           switch_history: list = None) -> Dict:
+        # Echo sides with the rule: hybrid_conflict_echo makes exactly the
+        # decisions rule makes (the timing control property), even when the
+        # physics signal proposes something else.
+        return {
+            "policy": rule_proposed_policy,
+            "trust": "rule",
+            "confidence": 1.0,
+            "reason": "echo: sides with rule proposal",
+            "model_used": "echo-model",
+            "latency_ms": 0.01,
+            "tokens_prompt": 0,
+            "tokens_completion": 0,
+        }

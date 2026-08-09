@@ -61,6 +61,28 @@ SWITCH_EVAL_PROMPT = (
     "confident the switch improves hit rate."
 )
 
+ARBITRATION_PROMPT = (
+    "You are a cache policy switch arbiter. Two independent classifiers "
+    "disagree about whether to switch the eviction policy:\n"
+    "(1) rule_proposed_policy -- the statistical classifier (zipf skew, "
+    "scan ratio, churn) says switch here.\n"
+    "(2) physics_proposed_policy -- a deterministic eviction-physics "
+    "signal (how far the eviction frontier is from the burst pool: "
+    "frontier_progress = evictions/capacity; burst_pool_survival_eta = "
+    "requests until the frontier breaches the burst pool) proposes a "
+    "switch.\n"
+    "They disagree, so one of them is wrong. Decide which proposal to "
+    "follow. The physics numbers are computed exactly from server metrics; "
+    "the rule signals are statistical estimates. If the physics says the "
+    "burst pool dies within one decision window (eta < decide_every), "
+    "trust physics unless the rule has strong counter-evidence. Reply with "
+    "EXACTLY one JSON object and nothing else: "
+    '{"policy": "lru|lfu|sieve", "trust": "rule" or "physics" or '
+    '"neither", "confidence": 0.0 to 1.0, "reason": "<15 words why>"}. '
+    "policy must be current_policy, rule_proposed_policy, or "
+    "physics_proposed_policy."
+)
+
 
 class LLMError(Exception):
     """Raised when an LLM decision cannot be produced."""
@@ -309,6 +331,51 @@ class RoundRobinLLMClient:
             resp["content"], resp["latency_ms"],
             resp["tokens_prompt"], resp["tokens_completion"])
 
+    def arbitrate_conflict(
+        self,
+        metrics: Dict,
+        workload_class: str = "",
+        current_policy: str = "",
+        rule_proposed_policy: str = "",
+        physics_proposed_policy: str = "",
+        signals: Optional[Dict] = None,
+        switch_history: Optional[List[Dict]] = None,
+    ) -> Dict:
+        """Ask the LLM to arbitrate a rule-vs-physics proposal conflict.
+
+        Called ONLY when the statistical rule and the deterministic
+        eviction-physics signal propose different actions -- the one place
+        the system has genuine ambiguity.  The LLM picks one of the two
+        proposals (real veto power, scoped to this disagreement).  Returns
+        {policy, trust, confidence, reason, model_used, latency_ms,
+        tokens_prompt, tokens_completion}.  Raises ``LLMError`` on
+        transport/parse failure.
+        """
+        if not self.ready:
+            raise LLMError(
+                "no Groq keys in environment (GROQ_API_KEY_1..N not found)"
+            )
+
+        user_content = json.dumps(
+            self._user_payload(metrics, workload_class, current_policy,
+                               signals, switch_history)
+        )
+        user_content = user_content[:-1] + (
+            ', "rule_proposed_policy": %s, "physics_proposed_policy": %s}'
+            % (json.dumps(rule_proposed_policy or "unknown"),
+               json.dumps(physics_proposed_policy or "unknown"))
+        )
+        messages = [
+            {"role": "system", "content": ARBITRATION_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+        resp = self._chat(messages)
+        return self._parse_arbitration(
+            resp["content"], resp["latency_ms"],
+            resp["tokens_prompt"], resp["tokens_completion"],
+            current_policy, rule_proposed_policy, physics_proposed_policy)
+
     def _parse(self, content: str, latency_ms: float, prompt_tokens: int,
                completion_tokens: int) -> Dict:
         try:
@@ -349,6 +416,41 @@ class RoundRobinLLMClient:
             "approve": approve,
             "confidence": max(0.0, min(1.0, confidence)),
             "reason": str(payload.get("reason", ""))[:120],
+            "model_used": self._last_model,
+            "latency_ms": round(latency_ms, 2),
+            "tokens_prompt": prompt_tokens,
+            "tokens_completion": completion_tokens,
+        }
+
+
+    def _parse_arbitration(self, content: str, latency_ms: float,
+                           prompt_tokens: int, completion_tokens: int,
+                           current_policy: str, rule_proposed: str,
+                           physics_proposed: str) -> Dict:
+        try:
+            payload = json.loads(_extract_json(content))
+        except (ValueError, TypeError) as exc:
+            raise LLMError("unparseable LLM response: %r (%s)"
+                           % (content[:120], exc))
+        policy = str(payload.get("policy", "")).lower()
+        allowed = {p for p in (current_policy, rule_proposed,
+                               physics_proposed) if p in VALID_POLICIES}
+        if policy not in allowed:
+            raise LLMError(
+                "arbitration policy %r not in {current, rule, physics} "
+                "proposals %s" % (policy, sorted(allowed)))
+        trust = str(payload.get("trust", "")).lower()
+        if trust not in ("rule", "physics", "neither"):
+            raise LLMError("invalid trust value from LLM: %r" % trust)
+        try:
+            confidence = float(payload.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        return {
+            "policy": policy,
+            "trust": trust,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "reason": str(payload.get("reason", ""))[:150],
             "model_used": self._last_model,
             "latency_ms": round(latency_ms, 2),
             "tokens_prompt": prompt_tokens,
