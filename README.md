@@ -187,6 +187,25 @@ Workload design (why this diverges at all): this server never inserts on GET mis
 
 No mode beats rule by ≥ 1 pt on a majority of seeds — **rule is the recommended default**. `hybrid_echo` (echo LLM) confirms the agent plumbing: |rule − echo| = 0.11 pt < 0.5 pt control bound. The earlier single-seed table (seed 7: rule 0.6348, hybrid 0.7151) is **not** reproducible: the +8.0 pt hybrid was a lucky LLM roll. Under **moderate churn** (0.30/0.30) llm is the first mode to clear the adopt bar (+1.3 pt mean, 3/5 seeds) — but the edge is a P2 gain (+6.5 pt) traded for a P3 loss (−2.3 pt) at every seed, its spread is 2x the rule's, and it contradicts the adversarial null (llm −0.2 pt); treat it as a candidate signal requiring reproduction, not an adoption. `hybrid_conflict` arbitrated **zero** conflicts across all three clean multi-seed runs (the physics signal always agrees with the rule). Full detail: `agent/RESULTS_COMPARISON.md` (regenerate with `python3 agent/compare_report.py --results ./compare_results.json`).
 
+### Rule agent vs static policies — same-run 5-seed table (2026-08-10)
+
+One `--mode all` invocation per seed (same 90K/1MB/11000 config, same harness, same 5 seeds) puts the rule agent and the three static policies in a single table. The static rows reproduce the eviction sweep above to 4 decimals, confirming the workloads are byte-identical.
+
+| Mode | Overall (mean ± std) | P1 | P2 | P3 |
+|---|---|---|---|---|
+| **pilot (rule agent)** | **0.6493 ± 0.0099** | 0.8013 | 0.5896 | 0.5648 |
+| static_sieve | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3867 |
+| static_lfu | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3867 |
+| static_lru | 0.1630 ± 0.0508 | 0.2885 | 0.0846 | 0.1200 |
+
+**Caveat — most of the gap is a rebuild artifact, not adaptation.** The agent's `SWITCH_POLICY` calls rebuild the policy by re-adding every key in `unordered_map` hash order, which *scrambles the eviction frontier*. On this workload the zipf-hot ranks are the earliest-preloaded keys and the static frontier kills them first by design ("even zipf-hot ranks die" — see the eviction sweep note), so any rebuild randomly scatters the hot ranks and they survive. Verified by a controlled probe replaying the exact seed-7 request stream: a rebuild at 861 keys reproduces the pilot's P1 window hit (0.963 vs 0.96 measured); a rebuild after a full preload lifts the same window to 1.000; the no-rebuild static scores 0.31. Concretely:
+
+- **P1 (+0.51 over static lfu): same policy, zero adaptation.** The agent's first switch fires mid-preload (`total_keys 861` of 14563 in the decision log — a wall-clock race between agent startup and preload completion, since preload SETs don't advance the agent's progress counter). The +0.51 is hash-order luck, not policy choice, and is timing-dependent.
+- **P2 (+0.36): mix of scrambles and real adaptation.** The sieve switch at ~15K and the rollback at ~33K both rebuild; the 48.5K sieve switch lands before P2's burst read.
+- **P3 (+0.18 over static sieve): the cleanest adaptive signal.** Sieve is held through the phase (last rebuild 11.5K before P3's burst read, which the scramble measurably *hurts* — pilot's P3 burst misses 57% vs static's 0%, because the rebuild resets burst-key frequencies). The residual +0.18 is genuine phase-appropriate policy choice (sieve for the bursty half, lfu for the stable half), not artifact.
+
+Takeaway: the headline "rule beats static by ~35 pt" is real in the table but is mostly `SWITCH_POLICY`'s incidental frontier randomization. A static LFU running with a pre-scrambled insertion order scores ~1.0 in P1. The defensible claims are (a) rule ≈ static-best + ~0.18 pt on the mixed phase, (b) the agent never scores below static lfu/sieve on any phase, and (c) the rebuild timing (landing before burst phases) is itself a real, if accidental, mechanism. Do **not** quote the overall +35 pt as adaptive benefit without this caveat; the planned compare extension (static modes inside `--compare`) will make the tables permanent.
+
 ## Tests
 
 ```sh

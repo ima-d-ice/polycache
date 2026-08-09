@@ -124,3 +124,24 @@ With decisions starting mid-phase-1 and the LLM consulted pre-evidence, the real
 ## Recommendation
 
 **INCONCLUSIVE -- use rule.**  Adversarial churn (the primary, verified-divergence config): every mode within 0.3 pt of rule (gaps: llm -0.2, hybrid +0.2, hybrid_conflict -0.0, hybrid_echo +0.1, hybrid_conflict_echo +0.3).  Moderate churn: llm is the first mode to clear the adopt bar (+1.3 pt, 3/5 seeds), but the edge is a P2/P3 trade at every seed, llm's per-seed spread is 2x the rule's, and it does not reproduce across regimes -- the same flip-flop roll documented in experiment (3).  Treat the moderate llm result as a candidate signal requiring reproduction on unseen seeds before any adoption; the LLM adds latency and cost for a per-seed coin-flip.
+
+## Rule agent vs static policies (same-run 5-seed table, 2026-08-10)
+
+One `--mode all` invocation per seed (90K / 1MB / hot-11000, seeds 1/7/42/123/999, `--spawn-agent`) measures static_lru / static_lfu / static_sieve / pilot (rule agent) on byte-identical workloads.  The static rows reproduce the README eviction sweep to 4 decimals.
+
+| Mode | Overall (mean +/- std) | P1 | P2 | P3 |
+|---|---|---|---|---|
+| pilot (rule agent) | 0.6493 +/- 0.0099 | 0.8013 | 0.5896 | 0.5648 |
+| static_sieve | 0.3041 +/- 0.0502 | 0.2890 | 0.2293 | 0.3867 |
+| static_lfu | 0.3041 +/- 0.0502 | 0.2890 | 0.2293 | 0.3867 |
+| static_lru | 0.1630 +/- 0.0508 | 0.2885 | 0.0846 | 0.1200 |
+
+### Caveat: most of the gap is the SWITCH_POLICY rebuild, not adaptation
+
+Every `SWITCH_POLICY` rebuilds the policy by re-adding all resident keys in `unordered_map` hash order, which scrambles the eviction frontier.  On this workload the zipf-hot ranks are the earliest-preloaded keys and the static frontier kills them first by design, so a rebuild randomly scatters the hot ranks and they survive.  Controlled probe (replaying the exact seed-7 stream against a live server): a rebuild at 861 keys reproduces the pilot's P1 window hit rate (0.963 vs 0.96 measured); a rebuild after the full preload lifts the same window to 1.000; the no-rebuild static scores 0.31.
+
+- **P1 (+0.51 over static lfu): same policy, zero adaptation.**  The agent's first switch fires mid-preload (decision log: `total_keys 861` of 14563 at progress 0) -- a wall-clock race between agent startup and preload completion, because preload SETs never advance the agent's hits+misses progress counter.  The P1 gain is hash-order luck and timing-dependent.
+- **P2 (+0.36): scramble mix + real adaptation.**  Switches at ~15K (sieve), ~33K (rollback to lfu) and ~48.5K (sieve, just before P2's burst read) all rebuild.
+- **P3 (+0.18 over static sieve): the cleanest adaptive signal.**  Sieve is held through P3 (last rebuild 11.5K before the phase).  The scramble measurably *hurts* the P3 burst read (pilot 43% vs static 100% on the burst window -- the rebuild resets burst-key frequencies), so the residual +0.18 is genuine phase-appropriate policy choice.
+
+Do not quote the overall +35 pt as adaptive benefit; the defensible claims are rule >= static-best on every phase, +0.18 pt on the mixed phase, and rebuild timing landing before burst phases as a real (if accidental) mechanism.  A static LFU with a pre-scrambled insertion order scores ~1.0 in P1.
