@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import socket
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -103,6 +104,19 @@ class TuningAgent:
         # every decide point (the old 5000-request flip-flop).
         self._switch_history: deque = deque(maxlen=5)
         self._llm_cache: Dict[tuple, Dict] = {}
+
+        # Fire-and-forget LLM consults: the rule decision executes at grid
+        # time; the consult runs on a background thread and either annotates
+        # (hybrid) or queues an override applied at the NEXT decide point
+        # (llm / hybrid_conflict arbitration).  This is what keeps the
+        # switch grid latency-independent: a synchronous 2.6s consult was
+        # shifting the effective switch positions ~6.5K requests off-grid,
+        # which swung single-seed results by +-13..20pt for ALL consult
+        # modes (proven by the hybrid==rule decisions + echo controls).
+        self._llm_lock = threading.Lock()
+        # (policy, reason) produced by an async consult; applied at the
+        # first decide point where cooldown allows, then cleared.
+        self._pending_override: Optional[tuple] = None
 
         self.analyzer = WorkloadAnalyzer()
 
@@ -205,8 +219,11 @@ class TuningAgent:
         line = json.dumps(decision)
         self.logger.info("decision %s", line)
         if self._decision_fh:
-            self._decision_fh.write(line + "\n")
-            self._decision_fh.flush()
+            # Worker threads log async consult results; serialize the file
+            # append so a single JSONL line can never be interleaved.
+            with self._llm_lock:
+                self._decision_fh.write(line + "\n")
+                self._decision_fh.flush()
 
     def _ingest_access_log(self) -> int:
         """Read new lines from the benchmark's access telemetry file.
@@ -256,50 +273,90 @@ class TuningAgent:
         self._llm = client
         self.decision_mode = "llm" if client is not None else "rule"
 
-    def _llm_decide(self, state: AgentState) -> Optional[Dict]:
-        """One LLM consult per cycle; writes a per-cycle ``kind:"llm"`` log.
+    # ------------------------------------------------- fire-and-forget LLM
 
-        Returns the client's pick dict on success, or None when no LLM is
-        configured or the consult failed (rule-based fallback).  The log
-        carries model/latency/tokens so the benchmark can report LLM stats
-        even when no switch is made.
+    def _build_consult_payload(self, state: AgentState, current: str,
+                               rule_target: str) -> Dict:
+        """Capture EVERY input an async consult needs, at fire time.
+
+        The worker thread must never touch ``self.analyzer`` /
+        ``self._access_history`` / ``self._switch_history`` -- the run loop
+        mutates them concurrently on the main thread.  Everything is
+        snapshotted here (main thread) and passed to the worker by value.
+        """
+        return {
+            "kind": "llm",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "current_policy": current,
+            "workload_class": str(state.get("workload", "")),
+            "rule_policy": rule_target,
+            "signals": self._llm_signals(state),
+            "metrics_snapshot": self._snapshot(state),
+            "switch_history": self._recent_switch_history(),
+        }
+
+    def _llm_decide(self, state: AgentState) -> Optional[Dict]:
+        """Deprecated llm mode: one consult per cycle, FIRE-AND-FORGET.
+
+        The rule proposal executes at grid time; the LLM's pick is queued
+        as a pending override and applied at the next decide point.  A
+        synchronous consult here would shift the switch grid by the
+        consult latency (~600ms..3s = thousands of requests), which is the
+        artifact that contaminated the previous compare run.  Always logs
+        a ``kind:"llm"`` entry (model/latency/tokens) from the worker.
         """
         llm = self._llm
         if llm is None:
             return None
         current = state.get("current_policy", "")
         workload = str(state.get("workload", ""))
-        payload = {
-            "kind": "llm",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "current_policy": current,
-            "workload_class": workload,
-            "rule_policy": POLICY_FOR_WORKLOAD.get(workload, ""),
-            "signals": self._llm_signals(state),
-            "metrics_snapshot": self._snapshot(state),
-        }
+        rule_target = POLICY_FOR_WORKLOAD.get(workload, "")
+        executed = rule_target if (rule_target and rule_target != current) \
+            else current
+        payload = self._build_consult_payload(state, current, rule_target)
+        threading.Thread(
+            target=self._llm_decide_worker,
+            args=(llm, payload, current, executed),
+            daemon=True,
+            name="llm-decide",
+        ).start()
+        return None
+
+    def _llm_decide_worker(self, llm: RoundRobinLLMClient,
+                           payload: Dict, current: str,
+                           executed: str) -> None:
         try:
             pick = llm.decide_policy(
-                state.get("metrics", {}), workload, current,
+                payload["metrics_snapshot"], payload["workload_class"],
+                current,
                 signals=payload["signals"],
-                switch_history=self._recent_switch_history())
+                switch_history=payload["switch_history"])
         except LLMError as exc:
             payload.update({"llm_policy": None, "fallback": True})
             self._log_decision(payload)
             self.logger.warning(
-                "LLM decision failed, falling back to rule-based (%s)", exc)
-            return None
+                "LLM decision failed, rule decision stands (%s)", exc)
+            return
+        policy = str(pick.get("policy", ""))
         payload.update({
-            "llm_policy": pick["policy"],
+            "llm_policy": policy,
             "llm_reason": pick.get("reason", ""),
             "llm_model": pick["model_used"],
             "llm_latency_ms": pick["latency_ms"],
             "llm_tokens_prompt": pick["tokens_prompt"],
             "llm_tokens_completion": pick["tokens_completion"],
             "fallback": False,
+            "async": True,
         })
         self._log_decision(payload)
-        return pick
+        if policy and policy != executed:
+            with self._llm_lock:
+                self._pending_override = (
+                    policy,
+                    "llm[%s] chose %s (async): %s"
+                    % (pick["model_used"], policy,
+                       pick.get("reason", "") or "no reason"),
+                )
 
     # -------------------------------------------------- LLM signal wiring
 
@@ -357,48 +414,55 @@ class TuningAgent:
     def _llm_evaluate_switch(
         self, state: AgentState, current: str, proposed: str
     ) -> Optional[Dict]:
-        """Hybrid diagnostic consult: ask the LLM to assess ONE proposed
-        switch (approve/confidence/reason).  The result is logged and the
-        rule proposal always executes -- the LLM cannot veto.
+        """Hybrid diagnostic consult (FIRE-AND-FORGET): ask the LLM to
+        assess ONE proposed switch (approve/confidence/reason).  The result
+        is logged asynchronously and the rule proposal always executes at
+        grid time -- the LLM cannot veto and cannot delay the switch.
 
-        Cached per (workload_class, current, proposed) so a recurring
-        proposal is consulted once per context.  Returns the LLM eval dict
-        or None on failure.  Always logs a ``kind:"llm"`` entry with the
-        eval fields.
+        Cached per (workload_class, current, proposed): a cache HIT is
+        zero-latency and returns the eval synchronously; a MISS spawns the
+        consult worker and returns None immediately (the ``kind:"llm"``
+        entry lands in the decision log when the consult returns).
         """
         llm = self._llm
         if llm is None:
             return None
         workload = str(state.get("workload", ""))
         cache_key = (workload, current, proposed)
-        if cache_key in self._llm_cache:
-            return self._llm_cache[cache_key]
-        signals = self._llm_signals(state)
-        payload = {
-            "kind": "llm",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "current_policy": current,
-            "workload_class": workload,
-            "rule_policy": proposed,
-            "signals": signals,
-            "metrics_snapshot": self._snapshot(state),
-        }
+        with self._llm_lock:
+            cached = self._llm_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        payload = self._build_consult_payload(state, current, proposed)
+        threading.Thread(
+            target=self._llm_evaluate_switch_worker,
+            args=(llm, payload, cache_key),
+            daemon=True,
+            name="llm-eval",
+        ).start()
+        return None
+
+    def _llm_evaluate_switch_worker(self, llm: RoundRobinLLMClient,
+                                    payload: Dict,
+                                    cache_key: tuple) -> None:
         try:
             eval_res = llm.evaluate_switch(
-                state.get("metrics", {}), workload, current, proposed,
-                signals=signals,
-                switch_history=self._recent_switch_history())
+                payload["metrics_snapshot"], payload["workload_class"],
+                payload["current_policy"], payload["rule_policy"],
+                signals=payload["signals"],
+                switch_history=payload["switch_history"])
         except LLMError as exc:
             payload.update({"llm_policy": None, "fallback": True})
             self._log_decision(payload)
             self.logger.warning(
-                "LLM switch eval failed, rule proposal proceeds (%s)", exc)
-            return None
+                "LLM switch eval failed, rule proposal stands (%s)", exc)
+            return
         approve = bool(eval_res.get("approve", False))
         payload.update({
             "llm_approve": approve,
             "llm_confidence": eval_res.get("confidence", 0.0),
-            "llm_policy": proposed if approve else current,
+            "llm_policy": (payload["rule_policy"] if approve
+                           else payload["current_policy"]),
             "llm_reason": eval_res.get("reason", ""),
             "llm_model": eval_res["model_used"],
             "llm_latency_ms": eval_res["latency_ms"],
@@ -406,57 +470,67 @@ class TuningAgent:
             "llm_tokens_completion": eval_res["tokens_completion"],
             "agreement": int(approve),
             "fallback": False,
+            "async": True,
         })
         self._log_decision(payload)
-        self._llm_cache[cache_key] = eval_res
-        return eval_res
+        with self._llm_lock:
+            self._llm_cache[cache_key] = eval_res
 
     def _llm_arbitrate(
         self, state: AgentState, current: str, rule_target: str,
-        physics_target: str
+        physics_target: str, executed: str
     ) -> Optional[Dict]:
-        """hybrid_conflict consult: the rule and the eviction-physics signal
-        propose different actions; ask the LLM to pick one (real veto power,
-        scoped to this engineered disagreement).
+        """hybrid_conflict consult (FIRE-AND-FORGET): the rule and the
+        eviction-physics signal propose different actions; ask the LLM to
+        pick one (real veto power, scoped to this engineered disagreement).
 
-        Cached per (workload_class, rule_target, physics_target).  Returns
-        the arbitration dict or None on failure (the rule proposal then
-        executes unchanged -- fail-safe by construction).  Always logs a
-        ``kind:"llm"`` entry with role "arbiter" and the conflict fields.
+        The rule proposal executes at GRID TIME; the arbiter's verdict
+        arrives on a background thread and is queued as a pending override
+        (applied at the next decide point) when it differs from what
+        executed -- latency can no longer shift switch positions.  A cache
+        HIT is zero-latency and returns synchronously (verdict applies this
+        cycle, as before).  A consult failure falls back to the rule
+        proposal unchanged -- fail-safe by construction.
         """
         llm = self._llm
         if llm is None:
             return None
         workload = str(state.get("workload", ""))
         cache_key = ("conflict", workload, rule_target, physics_target)
-        if cache_key in self._llm_cache:
-            return self._llm_cache[cache_key]
-        signals = self._llm_signals(state)
-        payload = {
-            "kind": "llm",
-            "role": "arbiter",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "current_policy": current,
-            "workload_class": workload,
-            "rule_policy": rule_target,
-            "physics_policy": physics_target,
-            "signals": signals,
-            "metrics_snapshot": self._snapshot(state),
-        }
+        with self._llm_lock:
+            cached = self._llm_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        payload = self._build_consult_payload(state, current, rule_target)
+        payload["physics_policy"] = physics_target
+        payload["role"] = "arbiter"
+        threading.Thread(
+            target=self._llm_arbitrate_worker,
+            args=(llm, payload, cache_key, executed),
+            daemon=True,
+            name="llm-arbiter",
+        ).start()
+        return None
+
+    def _llm_arbitrate_worker(self, llm: RoundRobinLLMClient,
+                              payload: Dict, cache_key: tuple,
+                              executed: str) -> None:
         try:
             arb = llm.arbitrate_conflict(
-                state.get("metrics", {}), workload, current,
-                rule_target, physics_target,
-                signals=signals,
-                switch_history=self._recent_switch_history())
+                payload["metrics_snapshot"], payload["workload_class"],
+                payload["current_policy"], payload["rule_policy"],
+                payload["physics_policy"],
+                signals=payload["signals"],
+                switch_history=payload["switch_history"])
         except LLMError as exc:
             payload.update({"llm_policy": None, "fallback": True})
             self._log_decision(payload)
             self.logger.warning(
-                "LLM arbitration failed, rule proposal proceeds (%s)", exc)
-            return None
+                "LLM arbitration failed, rule proposal stands (%s)", exc)
+            return
+        policy = str(arb.get("policy", ""))
         payload.update({
-            "llm_policy": arb["policy"],
+            "llm_policy": policy,
             "llm_trust": arb.get("trust", ""),
             "llm_confidence": arb.get("confidence", 0.0),
             "llm_reason": arb.get("reason", ""),
@@ -465,10 +539,21 @@ class TuningAgent:
             "llm_tokens_prompt": arb["tokens_prompt"],
             "llm_tokens_completion": arb["tokens_completion"],
             "fallback": False,
+            "async": True,
         })
         self._log_decision(payload)
-        self._llm_cache[cache_key] = arb
-        return arb
+        with self._llm_lock:
+            self._llm_cache[cache_key] = arb
+            if policy and policy != executed:
+                self._pending_override = (
+                    policy,
+                    "arbiter[%s] (async): rule=%s physics=%s llm=%s "
+                    "trust=%s conf=%.2f"
+                    % (payload["workload_class"], payload["rule_policy"],
+                       payload["physics_policy"], policy,
+                       arb.get("trust", ""),
+                       float(arb.get("confidence", 0.0))),
+                )
 
     # -------------------------------------------------------------- nodes
 
@@ -539,28 +624,52 @@ class TuningAgent:
                 }
 
         target = POLICY_FOR_WORKLOAD.get(str(state.get("workload", "")), "")
-        llm_pick: Optional[Dict] = None
         hybrid_detail: Optional[Dict] = None
+
+        # Fire-and-forget LLM override: an async consult (llm / arbiter)
+        # returned an action that differs from what executed at grid time.
+        # Apply it at the first decide point where cooldown allows, then
+        # clear -- grid-aligned, latency-independent.  If cooldown blocks,
+        # keep it pending (an override must never be silently lost).
+        with self._llm_lock:
+            pending = self._pending_override
+        if pending is not None:
+            over_policy, over_reason = pending
+            if over_policy != current:
+                if cooldown_ok:
+                    with self._llm_lock:
+                        self._pending_override = None
+                    return {
+                        "action": "switch",
+                        "desired_policy": over_policy,
+                        "reason": "llm override (async): " + over_reason,
+                    }
+            else:
+                with self._llm_lock:
+                    self._pending_override = None  # moot: already on it
+
         # Consult the LLM only when the agent has observed real traffic.
         # Pre-workload (empty access history) the classifier reads an empty
         # cache and any LLM "no activity" veto just preserves the default
         # policy -- on a skewed phase that costs the whole first phase.
         has_evidence = bool(self._access_history)
         if self.decision_mode == "llm":
+            # Deprecated mode, FIRE-AND-FORGET: the rule proposal executes
+            # at grid time; the LLM's pick (async) is queued as an override
+            # applied at the next decide point.
             if has_evidence:
-                llm_pick = self._llm_decide(state)
-            if llm_pick is not None:
-                target = llm_pick["policy"]
+                self._llm_decide(state)
         elif self.decision_mode == "hybrid":
             # Diagnostic fusion (experiment outcome: the LLM's veto never
             # beat the rule on a majority of seeds, so it no longer decides
             # anything).  The rule proposes; the LLM assesses the proposal
-            # as a risk annotator; the rule ALWAYS decides.  The eval is
-            # logged as a kind:"llm" entry plus hybrid_detail on the switch
-            # decision, but can never veto.  Consult only when a switch is
-            # on the table, the cooldown allows it, and the agent has seen
-            # traffic (pre-workload the classifier reads an empty cache and
-            # a consult is pure noise).
+            # as a risk annotator; the rule ALWAYS decides -- and now
+            # ALWAYS at grid time: the consult is fire-and-forget (async),
+            # the eval is logged as a kind:"llm" entry when it returns and
+            # can never veto or delay a switch.  Consult only when a switch
+            # is on the table, the cooldown allows it, and the agent has
+            # seen traffic (pre-workload the classifier reads an empty
+            # cache and a consult is pure noise).
             if (target and target != current and cooldown_ok
                     and has_evidence):
                 llm_eval = self._llm_evaluate_switch(state, current, target)
@@ -571,26 +680,35 @@ class TuningAgent:
                         "llm_confidence": llm_eval.get("confidence", 0.0),
                         "resolution": "rule",
                     }
-                # else: consult failed -> rule proposal executes unchanged.
+                else:
+                    # Cache miss: consult in flight; rule executes now, the
+                    # eval annotates the log when the worker returns.
+                    hybrid_detail = {
+                        "rule_proposal": target,
+                        "resolution": "deferred_consult",
+                    }
         elif self.decision_mode == "hybrid_conflict":
             # Deterministic physics + LLM arbitration of genuine conflicts.
             # The eviction-physics signal (burst pool survival eta) proposes
             # independently from the statistical rule.  Agreement (or a
             # silent physics signal) executes with 0 LLM calls -- the common
             # case.  Only a real rule-vs-physics disagreement routes to the
-            # LLM, and THERE the arbiter's pick actually executes (scoped
-            # veto power in the one place ambiguity was engineered).  A
-            # failed consult falls back to the rule proposal -- fail-safe
-            # by construction.
+            # LLM, and THERE the arbiter's pick has real veto power (scoped
+            # to this engineered ambiguity).  FIRE-AND-FORGET: the rule
+            # proposal executes at grid time; the arbiter's verdict arrives
+            # async and queues an override for the next decide point when
+            # it differs from what executed.  A failed consult falls back
+            # to the rule proposal -- fail-safe by construction.
             physics_target, eta_requests, frontier = self._physics_signal(
                 state)
             rule_switch = target if (target and target != current) else None
             if physics_target is None or physics_target == rule_switch:
                 pass  # agreement or no physics signal: rule executes
             elif cooldown_ok and has_evidence:
+                executed = target if rule_switch else current
                 arb = self._llm_arbitrate(state, current,
                                           rule_switch or current,
-                                          physics_target)
+                                          physics_target, executed)
                 if arb is not None:
                     arb_policy = str(arb.get("policy", ""))
                     hybrid_detail = {
@@ -607,15 +725,33 @@ class TuningAgent:
                         target = arb_policy
                     else:
                         target = current
-                # else: arbitration failed -> rule proposal executes.
+                else:
+                    # Cache miss: arbitration in flight; the rule executes
+                    # now, the arbiter's verdict applies next cycle.
+                    hybrid_detail = {
+                        "rule_proposal": rule_switch or current,
+                        "physics_proposal": physics_target,
+                        "physics_eta_requests": eta_requests,
+                        "physics_frontier": frontier,
+                        "resolution": "deferred_arbitration",
+                    }
             # else (physics disagrees but cooldown/evidence blocks the
             # consult): rule proposal executes unchanged.
         if target and target != current:
             if cooldown_ok:
-                if self.decision_mode == "llm" and llm_pick is not None:
-                    reason = ("llm[%s] chose %s: %s"
-                              % (llm_pick["model_used"], target,
-                                 llm_pick.get("reason", "") or "no reason"))
+                resolution = (hybrid_detail or {}).get("resolution")
+                if resolution == "deferred_consult":
+                    reason = (
+                        "hybrid[deferred]: rule->%s "
+                        "(LLM annotating, async)" % target
+                    )
+                elif resolution == "deferred_arbitration":
+                    reason = (
+                        "hybrid_conflict[deferred]: rule=%s physics=%s "
+                        "(arbiter consulting, async)"
+                        % (hybrid_detail["rule_proposal"],
+                           hybrid_detail["physics_proposal"])
+                    )
                 elif hybrid_detail is not None and "llm_trust" in hybrid_detail:
                     reason = (
                         "hybrid_conflict[%s]: rule=%s physics=%s llm=%s "

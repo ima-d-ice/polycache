@@ -1172,7 +1172,7 @@ def main(argv=None) -> int:
                              "42 123 999): per-seed compare runs, then an "
                              "aggregated mean +- std verdict.  Defaults to a "
                              "single seed (--seed or 7).")
-    parser.add_argument("--server-path", default=str(SCRIPT_DIR.parent / "adaptivecache"))
+    parser.add_argument("--server-path", default=str(SCRIPT_DIR.parent / "adapticache"))
     parser.add_argument("--aof-prefix", default="/tmp/adaptivecache_bench")
     parser.add_argument("--wait-timeout", type=float, default=10.0)
     parser.add_argument("--agent-log", default=None,

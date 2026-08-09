@@ -21,15 +21,15 @@ void LFU::add(const string& key, size_t size) {
     auto it = entries_.find(key);
     if (it != entries_.end()) {
         Entry& e = it->second;
-        memory_used_ -= key.size() + e.size;
+        memory_used_ -= (key.size() + e.size);
         e.size = size;
-        memory_used_ += key.size() + size;
+        memory_used_ += (key.size() + size);
         return;
     }
     buckets_[1].push_front(key);
     entries_.emplace(key, Entry{size, 1, buckets_[1].begin()});
     min_freq_ = 1;
-    memory_used_ += key.size() + size;
+    memory_used_ += (key.size() + size);
 }
 
 void LFU::remove(const string& key) {
@@ -42,7 +42,7 @@ void LFU::remove(const string& key) {
     if (buckets_[e.freq].empty() && e.freq == min_freq_) {
         ++min_freq_;
     }
-    memory_used_ -= key.size() + e.size;
+    memory_used_ -= (key.size() + e.size);
     entries_.erase(it);
 }
 

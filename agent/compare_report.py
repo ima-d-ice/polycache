@@ -282,7 +282,10 @@ def build_report(data: dict, results_path: Path) -> str:
         "",
         "Hybrid consults the LLM ONLY when the rule proposes a switch "
         "(and the cooldown would allow it) -- steady-state cycles pay no "
-        "LLM latency.  Each such consult is synchronous (~%s average)."
+        "LLM latency.  Consults are FIRE-AND-FORGET (async worker threads): "
+        "the rule switch executes at grid time and the consult annotates "
+        "after the fact, so consult latency (~%s average) can never shift "
+        "the switch grid."
         % _fmt_ms(hyb_stats.get("avg_latency_ms"), 0),
         "",
     ]

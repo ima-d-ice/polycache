@@ -10,26 +10,32 @@ A self-tuning in-memory cache server written in C++17, paired with an autonomous
 
 The cache itself is a small, fast Redis-style server. The interesting part is what happens above it: a LangGraph agent watches live telemetry (hit rate, policy, eviction rate), classifies the workload, and issues `SWITCH_POLICY` commands over TCP — every switch is logged, and a rollback guardrail reverts any change that makes the hit rate drop more than 10%.
 
-Three decision modes are available and A/B comparable on identical workloads:
+Three decision modes are available and A/B comparable on identical workloads (plus `hybrid_conflict`, the current experiment under test):
 
 | Mode | Behavior |
 |---|---|
 | `rule` | Heuristic classifier: zipf skew → SIEVE, scanning → LRU, stable → LFU, bursty → SIEVE |
 | `hybrid` | Rule decides; the LLM is consulted on switch proposals as a **diagnostic annotator** (approve/confidence/reason logged, cannot veto) |
+| `hybrid_conflict` | Rule + deterministic eviction-physics signal (burst-pool survival ETA); the LLM arbitrates **only** when they genuinely disagree (scoped veto) |
 | `llm` | LLM picks the policy each cycle — **deprecated**: lost to rule in controlled experiments (see below) |
 
-The LLM layer is strictly opt-in (Groq, round-robin across three models with failover), costs on the order of $0.001 per benchmark run, and falls back to rules on any failure.
+The LLM layer is strictly opt-in (Groq, round-robin across three models with failover), costs on the order of $0.001 per benchmark run, and falls back to rules on any failure.  All LLM consults are **fire-and-forget** (async worker threads): the rule decision always executes at grid time, so consult latency can never shift the switch positions (this fixed a harness artifact that swung the previous compare +13..20 pt).
 
 ### Results at a glance (90K requests, 1 MB cache, 5 seeds: 1/7/42/123/999)
 
+Adversarial churn (0.50/0.50 — the verified-divergence config):
+
 | Mode | Overall hit rate (mean ± std) | vs Rule |
 |---|---|---|
-| **rule** | **65.4% ± 1.0** | — |
-| llm (deprecated) | 66.5% ± 4.1 | +1.1 pt (variance, not signal) |
-| hybrid (diagnostic) | 65.1% ± 0.7 | −0.3 pt (noise: equals rule by construction) |
-| hybrid_echo (control) | 64.9% ± 0.7 | −0.5 pt |
+| **rule** | **65.1% ± 0.7** | — |
+| llm (deprecated) | 64.9% ± 1.1 | −0.2 pt |
+| hybrid (diagnostic) | 65.2% ± 0.4 | +0.2 pt |
+| hybrid_conflict | 65.0% ± 0.6 | −0.0 pt |
+| hybrid_echo (control) | 65.2% ± 1.0 | +0.1 pt |
 
-Eviction-policy divergence (LFU/SIEVE vs LRU) is reproducible across 5 seeds. The earlier single-seed claim that hybrid beats rule by +8.0 pt does **not** reproduce: that run drew a lucky LLM roll at seed 7 (today seed 7 gives llm +7.4 pt, seeds 123/1 give −3.6/−1.5 pt). With the LLM layer the spread across seeds is ±4.1 pt — it adds variance, not value, on this workload. The LLM layer was demoted to a diagnostic role after three controlled experiments (un-gated consults cost 26–41 pt; evidence-gated vetoes became static-LFU; a confidence gate never opened and enriched signals still flip-flopped). Full numbers: [Benchmarks](#benchmarks) and `agent/RESULTS_COMPARISON.md`.
+Moderate churn (0.30/0.30): rule 73.5% ± 0.8, llm 74.8% ± 1.5 (+1.3 pt — the first regime where an LLM mode clears the adopt bar, a P2/P3 trade at every seed; see below), hybrid 74.3% ± 1.2, hybrid_conflict 73.4% ± 0.9.
+
+Eviction-policy divergence (LFU/SIEVE vs LRU) is reproducible across 5 seeds. The earlier single-seed claim that hybrid beats rule by +8.0 pt does **not** reproduce: that run drew a lucky LLM roll at seed 7. With the LLM layer the spread across seeds is ~1-4 pt — it adds variance, not value, on this workload. The LLM layer was demoted to a diagnostic role after three controlled experiments (un-gated consults cost 26–41 pt; evidence-gated vetoes became static-LFU; a confidence gate never opened and enriched signals still flip-flopped), and experiment 4 — a deterministic physics signal with LLM arbitration of genuine rule-vs-physics conflicts — never produced a single conflict across three clean multi-seed runs (the physics signal always agrees with the rule at the burst-pool breach moment). Full numbers: [Benchmarks](#benchmarks) and `agent/RESULTS_COMPARISON.md`.
 
 ## Architecture
 
@@ -61,10 +67,10 @@ sequenceDiagram
         AG->>C: poll /metrics + access telemetry
         C-->>AG: hit_rate, policy, workload signals
         AG->>AG: classify (zipf / scan / churn)
-        alt decision_mode = hybrid (diagnostic)
-            opt rule proposes a switch
-                AG->>G: evaluate_switch (approve/confidence/reason)
-                G-->>AG: eval (~0.5-0.8s, logged, cannot veto)
+        alt decision_mode = hybrid / hybrid_conflict (diagnostic/arbiter)
+            opt rule proposes a switch (or rule-physics conflict)
+                AG-->>G: consult (FIRE-AND-FORGET: async worker thread)
+                G-->>AG: eval / arbitration (logged; never blocks a switch)
             end
         end
         opt target != current and cooldown ok
@@ -98,7 +104,7 @@ sequenceDiagram
 
 **Why an agent instead of a static policy?** Real workloads shift. The benchmark's own phases (skewed → hot+scan → mixed) show that a single fixed policy gives up 14-28 points in hit rate versus the right policy per phase. The agent pays one cheap metrics poll per second to keep the cache on the right policy, and the rollback guardrail bounds the downside of a bad switch.
 
-**Why hybrid?** Hybrid is now a **diagnostic layer**: the rule decides, and the LLM annotates switch proposals (approve/confidence/reason) in the decision log. Three controlled 5-seed experiments led to this demotion: (1) un-gated consults let the LLM veto the pre-workload lru→lfu switch ("no activity, keep current stable policy") and cost 26–41 pt; (2) evidence-gated vetoes made the LLM veto 66.7% of proposals — hybrid became static LFU with a −10 pt P2 / +12 pt P3 trade, i.e. the veto's default action, not insight; (3) a rule-confidence gate plus raw zipf/scan/churn/trend/switch-history signals produced no improvement — the gate never opened in request-quantized mode and the enriched `llm` mode still flip-flopped (±4.1 pt across seeds; per-seed −3.6 to +7.4 pt is a roll, not a strategy). `llm` mode remains opt-in but deprecated; `hybrid` costs ~$0.0002 and ~0.6-0.8 s only when a switch is actually proposed.
+**Why hybrid?** Hybrid is now a **diagnostic layer**: the rule decides, and the LLM annotates switch proposals (approve/confidence/reason) in the decision log. Three controlled 5-seed experiments led to this demotion: (1) un-gated consults let the LLM veto the pre-workload lru→lfu switch ("no activity, keep current stable policy") and cost 26–41 pt; (2) evidence-gated vetoes made the LLM veto 66.7% of proposals — hybrid became static LFU with a −10 pt P2 / +12 pt P3 trade, i.e. the veto's default action, not insight; (3) a rule-confidence gate plus raw zipf/scan/churn/trend/switch-history signals produced no improvement — the gate never opened in request-quantized mode and the enriched `llm` mode still flip-flopped (±4.1 pt across seeds; per-seed −3.6 to +7.4 pt is a roll, not a strategy). Experiment 4 (`hybrid_conflict` — a deterministic burst-pool-survival physics signal with LLM arbitration of genuine rule-vs-physics conflicts) is a systematic null: the physics signal fired exactly once per seed at the breach moment and always agreed with the rule, so the arbiter was never exercised in three clean multi-seed runs (adversarial ×2, moderate ×1). `llm` mode remains opt-in but deprecated; `hybrid` costs ~$0.0002 and ~0.6-3.6 s only when a switch is actually proposed — and since consults are fire-and-forget, that latency never shifts the switch grid.
 
 **Why fair A/B?** Every decision-mode sub-run replays the identical workload at identical length on a fresh server. An explicit `--llm-requests` cap (for cheap smoke tests) prints a loud NOT-COMPARABLE warning and is excluded from the report's recommendation. Equal pressure or nothing.
 
@@ -168,16 +174,18 @@ LFU and SIEVE beat LRU in the scan-heavy phases at **every seed** (P3 gap +0.26-
 
 Workload design (why this diverges at all): this server never inserts on GET miss and every SET evicts exactly one key, so the eviction frontier walks the preload order under cold churn — even zipf-hot ranks die. The burst pool sits at the preload tail and per-phase churn must exceed the burst-key rank offset, or the frontier never reaches the burst keys and every policy scores the same. At `--requests 30000` the churn is too low and all policies measure identically — 90K is the minimum comparable length.
 
-### Decision modes — fair 5-seed comparison (90K requests, equal length)
+### Decision modes — fair 5-seed comparison (90K requests, equal length, adversarial churn)
 
 | Mode | Overall HR (mean ± std) | P1 HR | P2 HR | P3 HR | Switches | LLM calls | Fallback | Est. cost |
 |---|---|---|---|---|---|---|---|---|
-| **rule** | **0.6542 ± 0.0095** | 0.8096 | 0.5915 | 0.5693 | 3.0 | 0 | 0% | $0.00 |
-| llm (deprecated) | 0.6647 ± 0.0408 | 0.7993 | 0.6219 | 0.5804 | 5.0 | 75 | 0% | ~$0.001 |
-| hybrid (diagnostic) | 0.6512 ± 0.0073 | 0.8069 | 0.5871 | 0.5674 | 3.0 | 0 | 0% | ~$0.0000 |
-| hybrid_echo | 0.6494 ± 0.0065 | 0.8025 | 0.5887 | 0.5648 | 3.0 | 0 | 0% | $0.00 |
+| **rule** | **0.6506 ± 0.0065** | 0.8067 | 0.5863 | 0.5666 | 3.0 | 0 | 0% | $0.00 |
+| llm (deprecated) | 0.6489 ± 0.0114 | 0.8108 | 0.5925 | 0.5521 | 5.0 | 60 | 0% | ~$0.001 |
+| hybrid (diagnostic) | 0.6522 ± 0.0042 | 0.8064 | 0.5884 | 0.5693 | 3.0 | 5 | 0% | ~$0.0002 |
+| hybrid_conflict | 0.6502 ± 0.0062 | 0.8133 | 0.5777 | 0.5671 | 3.0 | 0 | 0% | $0.00 |
+| hybrid_echo (control) | 0.6517 ± 0.0097 | 0.8101 | 0.5813 | 0.5711 | 3.0 | 5 | 0% | $0.00 |
+| hybrid_conflict_echo | 0.6534 ± 0.0060 | 0.8124 | 0.5877 | 0.5679 | 3.0 | 0 | 0% | $0.00 |
 
-No mode beats rule by ≥ 1 pt on a majority of seeds — **rule is the recommended default**. `hybrid_echo` (echo LLM) confirms the agent plumbing: |rule − echo| = 0.48 pt < 0.5 pt control bound. The earlier single-seed table (seed 7: rule 0.6348, hybrid 0.7151) is **not** reproducible: the +8.0 pt hybrid was a lucky LLM roll, and the same seed-7 today yields +7.4 pt for llm in one run and −3.6 pt at seed 123 in another. LLM consults succeed 100% of the time (0% fallback) at ~0.5-0.8 s each; the llm mode's 4.1 pt seed-spread is the model's own oscillation, not plumbing noise. Hybrid's zero-consult run here is the final experiment's artifact (the rule-confidence gate never opened); in the current diagnostic design hybrid consults only when a switch is proposed. Full detail: `agent/RESULTS_COMPARISON.md` (regenerate with `python3 agent/compare_report.py --results ./compare_results.json`).
+No mode beats rule by ≥ 1 pt on a majority of seeds — **rule is the recommended default**. `hybrid_echo` (echo LLM) confirms the agent plumbing: |rule − echo| = 0.11 pt < 0.5 pt control bound. The earlier single-seed table (seed 7: rule 0.6348, hybrid 0.7151) is **not** reproducible: the +8.0 pt hybrid was a lucky LLM roll. Under **moderate churn** (0.30/0.30) llm is the first mode to clear the adopt bar (+1.3 pt mean, 3/5 seeds) — but the edge is a P2 gain (+6.5 pt) traded for a P3 loss (−2.3 pt) at every seed, its spread is 2x the rule's, and it contradicts the adversarial null (llm −0.2 pt); treat it as a candidate signal requiring reproduction, not an adoption. `hybrid_conflict` arbitrated **zero** conflicts across all three clean multi-seed runs (the physics signal always agrees with the rule). Full detail: `agent/RESULTS_COMPARISON.md` (regenerate with `python3 agent/compare_report.py --results ./compare_results.json`).
 
 ## Tests
 
@@ -197,7 +205,7 @@ Each binary compiles only the translation units it exercises — the server's `m
 
 - **Decision-mode results are single-run evidence.** The agent's 1s polling cycle aligns to wall clock, not workload position, so switch timing jitter moves the numbers run to run (llm -0.25pt vs rule at 90K is well within that noise). Stronger claims need repeated runs with a mean/std summary.
 - **The rule agent can thrash.** The 90K rule trace shows sieve↔lfu flip-flops with rollback churn; cooldown bounds but does not eliminate it.
-- **LLM latency is paid synchronously.** A hybrid consult (~0.5-0.8s Groq call) blocks only the decision cycle that happens to coincide with a switch proposal (steady-state cycles pay nothing); `llm` mode pays it every cycle (mitigated by failover + fallback, never by blocking the cache itself).
+- **LLM consults are fire-and-forget by design.** Rule decisions execute at grid time; consult latency (~0.5-3.6s Groq call) is absorbed by async worker threads and llm/arbiter verdicts apply at the next decide point, so latency can never shift the switch grid (a synchronous variant of this cost the previous compare run +13..20 pt of artifact).
 - **fsync-per-write AOF** prioritizes durability over write throughput by design.
 - **No replication or sharding** — the single epoll thread is the throughput ceiling, and the design favors reasoning about concurrency over scaling out.
 - **macOS `epoll_compat.h` is a shim**, not production epoll; the shim has one known race class (shared fake epfd across instances) which is mitigated with an atomic counter + global mutex.

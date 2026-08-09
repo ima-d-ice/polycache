@@ -1,5 +1,6 @@
 *.o
 *.d
+*.aof
 adapticache
 test_sieve
 test_protocol
