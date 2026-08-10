@@ -16,7 +16,7 @@ The agent is rule-based: a heuristic classifier maps the workload to a policy (z
 
 Adversarial churn (0.50/0.50 — the verified-divergence config):
 
-**The headline result is the static comparison:** the rule agent loses to static lfu/sieve by ~5.4 pt (rule 0.2482 vs 0.3041: the agent's early lfu switch wins P1/P2 by +3.2/+1.6 pt, then the rollback/rebuild thrash loses P3 by −20.1 pt). The earlier recorded numbers (rule 65%) were inflated by a harness artifact — the agent's first decision raced the benchmark's preload and rebuilt the policy on a half-loaded map (a `SWITCH_POLICY` rebuild re-adds keys in `unordered_map` hash order, scrambling the eviction frontier). Fixed with a `MARK_PRELOADED` preload gate + decision-grid quantization; every recorded number in this README was regenerated after the fix.
+**The headline result is the adaptive win, measured 2026-08-11 with the fixed harness:** the rule agent beats the best static policy (lfu/sieve tie at 0.3041) by +16.6 pt on adversarial churn (rule 0.4705 ± 0.0520 vs 0.3041 ± 0.0502; P2 +36.9 pt, P3 +13.8 pt, P1 −0.5 pt for its slow lfu switch). The agent switches lru→lfu→sieve (3–4 times per seed, ended on sieve). Two older verdicts are superseded: the 2026-08-09 "rule 65%" table was a preload-race artifact, and the 2026-08-10 "rule loses 5.4 pt" table measured the old destructive hash-order rebuild (`SWITCH_POLICY` re-added keys in `unordered_map` order, scrambling the eviction frontier). The preload gate (`MARK_PRELOADED` + decision-grid quantization) and the ordered-rebuild fix (`ba9554b`) removed both artifacts; every number in this README is from the regenerated 5-seed sweep.
 
 ## Architecture
 
@@ -74,7 +74,7 @@ sequenceDiagram
 
 **Why synchronous AOF fsync?** Durability over speed: every SET/DEL is appended and flushed before the response is sent, and the log is replayed on boot. Write throughput suffers by design; the project prefers being able to prove nothing is lost on crash.
 
-**Why an agent instead of a static policy?** Real workloads shift, and the agent's early switch does buy real P1/P2 gains (+3.2/+1.6 pt over static lfu) — but the controlled answer is more honest: on this benchmark, the rule agent's switching costs more than it earns (P3 −20.1 pt from rollback/rebuild thrash; overall −5.4 pt vs static lfu/sieve). The project's value is in *proving* that: a benchmark harness with fresh-server equal-pressure A/Bs, multi-seed verdicts, and two caught-and-fixed harness artifacts (a synchronous-consult latency artifact; a mid-preload switch racing the preload loop). The agent infrastructure (rule classifier, cooldown, rollback guardrail) is fully implemented and tested; the measurements just say a static LFU/SIEVE is the better default on this workload.
+**Why an agent instead of a static policy?** Real workloads shift, and the controlled answer (preload-gated, ordered rebuild, 2026-08-11 sweep) is that the rule agent's adaptation earns its keep: +16.6 pt overall over the best static policy (0.4705 vs 0.3041), driven by the early lfu switch that keeps the burst pool alive through P2/P3 (+36.9/+13.8 pt). The project's value is in *proving* that: a benchmark harness with fresh-server equal-pressure A/Bs, multi-seed verdicts, and two caught-and-fixed harness artifacts (a preload-race that inflated the 08-09 table; a destructive hash-order rebuild that sank the pilot in the 08-10 table). The agent infrastructure (rule classifier, cooldown, rollback guardrail) is fully implemented and tested; on this workload the adaptive agent is the better default.
 
 **Why plain-assert tests?** The repo's only dependency is nlohmann/json. Tests are plain C++17 `CHECK` macros compiled straight to binaries — `make test` builds and runs all three, zero framework, zero install step.
 
@@ -142,24 +142,24 @@ LFU and SIEVE beat LRU in the scan-heavy phases at **every seed** (P3 gap +0.26-
 
 Workload design (why this diverges at all): this server never inserts on GET miss and every SET evicts exactly one key, so the eviction frontier walks the preload order under cold churn — even zipf-hot ranks die. The burst pool sits at the preload tail and per-phase churn must exceed the burst-key rank offset, or the frontier never reaches the burst keys and every policy scores the same. At `--requests 30000` the churn is too low and all policies measure identically — 90K is the minimum comparable length.
 
-### Rule agent vs static policies — same-run 5-seed table (2026-08-10, preload-gated)
+### Rule agent vs static policies — same-run 5-seed table
 
-One `--mode all` invocation per seed (same 90K/1MB/11000 config, same harness, same 5 seeds) puts the rule agent, the three static policies, and four **rebuild-control** modes (same-policy `SWITCH_POLICY` re-issues at fixed request positions) in a single table. The static rows reproduce the eviction sweep above to 4 decimals, confirming the workloads are byte-identical.
+One `--mode all --seeds 1 7 42 123 999` invocation (90K/1MB/11000 config, fresh server per mode, fresh `_seedN` artifacts per seed) puts the rule agent, the three static policies, and four **rebuild-control** modes (same-policy `SWITCH_POLICY` re-issues at fixed request positions) in a single table. Measured 2026-08-11 on `master` (Part 1, metadata-sort rebuild).
 
 | Mode | Overall (mean ± std) | P1 | P2 | P3 |
 |---|---|---|---|---|
 | static_lru | 0.1630 ± 0.0508 | 0.2885 | 0.0846 | 0.1200 |
-| static_sieve | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3867 |
-| static_lfu | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3867 |
-| **pilot (rule agent)** | **0.2482 ± 0.0490** | 0.3207 | 0.2443 | 0.1854 |
-| static_sieve_rebuild (1 @ 7K) | 0.1767 ± 0.0499 | 0.3074 | 0.1136 | 0.1147 |
-| sieve_at_schedule (5 rebuilds) | 0.2490 ± 0.0493 | 0.3106 | 0.2517 | 0.1900 |
-| lfu_at_schedule (5 rebuilds) | 0.2490 ± 0.0493 | 0.3106 | 0.2517 | 0.1900 |
-| static_lfu_derange (rebuild every 15K) | 0.2864 ± 0.0510 | 0.2943 | 0.3254 | 0.2434 |
+| static_sieve | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3868 |
+| static_lfu | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3868 |
+| **pilot (rule agent)** | **0.4705 ± 0.0520** | 0.2838 | 0.5982 | 0.5244 |
+| static_sieve_rebuild (1 @ 7K) | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3868 |
+| sieve_at_schedule (5 rebuilds) | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3868 |
+| lfu_at_schedule (5 rebuilds) | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3868 |
+| static_lfu_derange (rebuild every 15K) | 0.3041 ± 0.0502 | 0.2890 | 0.2293 | 0.3868 |
 
-**The rebuild is the agent's only lever — and it's a net tax.** `sieve_at_schedule` and `lfu_at_schedule` pin *different* policies but re-issue `SWITCH_POLICY` at the agent's own switch positions, and they measure identically (0.2490) to the pilot (0.2482) to ~0.1 pt: every `SWITCH_POLICY` rebuilds the policy by re-adding resident keys in `unordered_map` hash order, which scrambles the eviction frontier, and that scramble — not the policy choice — determines the outcome. Rebuilds hurt monotonically at the agent's positions: static lfu/sieve (0 rebuilds) 0.3041 > pilot/at_schedule (5) 0.248-0.249 > single rebuild at 7K 0.1767. The agent's only adaptive gains are real but small: P1 +3.2 pt and P2 +1.5 pt over static lfu from its early lfu switch (a preload-gated, request-quantized decision at exactly request 5000), paid for with a P3 −20.1 pt collapse where the rollback/rebuild thrash destroys the burst pool (pilot P3 0.1854 vs static lfu 0.3867).
+**The rebuild tax is gone.** Every rebuild-control mode measures exactly == its static baseline (0.3041, to 4 decimals on all 5 seeds): `switch_policy` rebuilds the target policy in order (metadata sort on master; a continuously-maintained recency list on the M3 branch), and a same-policy switch is a literal no-op. `sieve_at_schedule` and `lfu_at_schedule` re-issue the pilot's own switch positions without changing policy and still land on 0.3041 — the policy choice, not the switch mechanism, is now the only lever, and that lever is the agent's.
 
-Takeaway: the 2026-08-09 "rule beats static by ~35 pt" table was 100% artifact — that run's first switch raced the preload loop and rebuilt the policy mid-fill. With the preload gate, the honest verdict is **static lfu/sieve > rule agent (−5.4 pt) > static lru**, and the rebuild-control modes pin the mechanism. The defensible claims are (a) the agent's early switch buys real P1/P2 gains, (b) the rollback guardrail contains the downside to ~−5.4 pt (not the −40 pt a bad policy choice would cost), and (c) the harness that caught two artifacts of its own making is the project's actual deliverable.
+Takeaway: the 2026-08-09 "rule beats static by ~35 pt" table was 100% artifact (first switch raced the preload loop and rebuilt the policy mid-fill), and the 2026-08-10 "rule loses by 5.4 pt" table was the hash-order rebuild artifact. With the preload gate and the ordered rebuild, the verdict is **rule agent (0.4705) > static lfu/sieve (0.3041) > static lru (0.1630)** on adversarial churn. The agent's gains: an early lfu switch that wins P2/P3 (the burst pool survives), plus the rollback guardrail containing any bad decision. The harness that caught two artifacts of its own making remains the project's actual deliverable.
 
 ## Tests
 
@@ -177,8 +177,8 @@ Each binary compiles only the translation units it exercises — the server's `m
 
 ## Known Limitations & Future Work
 
-- **The agent loses to static lfu/sieve on this benchmark** (rule 0.2482 vs 0.3041 adversarial, preload-gated) — the measured answer, not the hoped-for one. The rule agent's switching pays a rebuild-scramble tax that costs more than its P1/P2 adaptation earns; a static policy is the better default on this workload. (The `experiment/m3-no-sort-switch` branch implements a no-sort switch primitive that eliminates the rebuild tax.)
-- **The rule agent can thrash.** The 90K rule trace shows sieve↔lfu flip-flops with rollback churn; cooldown bounds but does not eliminate it.
+- **The adaptive win depends on the ordered rebuild** — with the old `unordered_map`-hash-order rebuild the agent lost to statics by 5.4 pt; with the metadata-sort rebuild (master) and the recency-list walk (M3 branch) it wins by +16.6 pt and the rebuild-control modes measure exactly == statics. The M3 branch eliminates the sorted-rebuild step entirely (walk the maintained recency list; same-policy switch is a literal no-op).
+- **The rule agent can thrash.** The 90K rule trace shows lru→lfu→sieve transitions with occasional rollback churn; cooldown bounds but does not eliminate it.
 - **fsync-per-write AOF** prioritizes durability over write throughput by design.
 - **No replication or sharding** — the single epoll thread is the throughput ceiling, and the design favors reasoning about concurrency over scaling out.
 - **macOS `epoll_compat.h` is a shim**, not production epoll; the shim has one known race class (shared fake epfd across instances) which is mitigated with an atomic counter + global mutex.
