@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <vector>
 
 using namespace std;
 
@@ -16,8 +17,18 @@ Storage::Storage(size_t memory_limit)
 
 void Storage::set(const string& key, const string& value, int ttl_sec) {
     lock_guard<mutex> lk(lock_);
-    data_[key] = value;
-    policy_->add(key, value.size());
+    auto& meta = data_[key];
+    const bool is_new = (meta.insert_seq == 0);
+    if (is_new) {
+        meta.insert_seq = ++access_seq_;
+        meta.freq = 0;
+        meta.visited = false;
+    }
+    meta.value = value;
+    meta.size = value.size();
+    meta.last_access_seq = ++access_seq_;
+    ++meta.freq;
+    policy_->add(key, meta.size);
     if (ttl_sec > 0) {
         ttl_.set_ttl(key, chrono::seconds(ttl_sec));
     } else {
@@ -39,9 +50,13 @@ optional<string> Storage::get(const string& key) {
         ++misses_;
         return nullopt;
     }
+    KeyMeta& meta = it->second;
+    meta.last_access_seq = ++access_seq_;
+    ++meta.freq;
+    meta.visited = true;          // a hit marks the key visited (SIEVE)
     policy_->touch(key);
     ++hits_;
-    return it->second;
+    return meta.value;
 }
 
 bool Storage::del(const string& key) {
@@ -72,9 +87,66 @@ bool Storage::switch_policy(const string& name) {
     } else {
         return false;
     }
-    for (const auto& [key, value] : data_) {
-        next->add(key, value.size());
+
+    // Collect resident keys with their metadata, then rebuild the new policy
+    // in a deterministic order that preserves the eviction frontier. The old
+    // hash-random iteration (for (auto& [k,v] : data_)) scrambled the frontier
+    // and was the tax that made every switch a net loss.
+    vector<pair<const string*, KeyMeta*>> ordered;
+    ordered.reserve(data_.size());
+    for (auto& [key, meta] : data_) {
+        ordered.emplace_back(&key, &meta);
     }
+
+    if (lower == "lru") {
+        // Most-recently-used first => the rebuilt list is correctly ordered
+        // (LRU evicts from the back = least recent).
+        sort(ordered.begin(), ordered.end(),
+             [](const auto& a, const auto& b) {
+                 return a.second->last_access_seq > b.second->last_access_seq;
+             });
+        for (auto& [key, meta] : ordered) {
+            next->add(*key, meta->size);
+        }
+    } else if (lower == "lfu") {
+        // Lowest frequency first, recency tiebreak => buckets come out ordered.
+        sort(ordered.begin(), ordered.end(),
+             [](const auto& a, const auto& b) {
+                 if (a.second->freq != b.second->freq)
+                     return a.second->freq < b.second->freq;
+                 return a.second->last_access_seq < b.second->last_access_seq;
+             });
+        for (auto& [key, meta] : ordered) {
+            next->add(*key, meta->size);
+        }
+    } else { // sieve
+        // Recency order, coldest first. SIEVE evicts from the tail backward
+        // sweeping unvisited keys; with all visited bits cold after a rebuild,
+        // the tail is evicted first, so the least-recently-used keys must be at
+        // the tail. SIEVE.add() puts each new key at the head, so adding
+        // coldest-first leaves the coldest at the tail and the hottest at the
+        // head (furthest from the hand). Cold-start the visited bits.
+        sort(ordered.begin(), ordered.end(),
+             [](const auto& a, const auto& b) {
+                 return a.second->last_access_seq < b.second->last_access_seq;
+             });
+        for (auto& [key, meta] : ordered) {
+            next->add(*key, meta->size);
+        }
+        // Restore the visited-bit frontier: a SIEVE rebuild cold-starts every
+        // visited bit to false, which makes every key immediately evictable
+        // and destroys the "recently accessed are protected" invariant. SIEVE
+        // evicts from the tail backward skipping visited keys, so replay the
+        // recently-accessed (visited) keys now that the hot ones sit near the
+        // head. This is a no-op for LRU/LFU (their touch() reorders, so the
+        // replay is skipped for them).
+        for (auto& [key, meta] : ordered) {
+            if (meta->visited) {
+                next->touch(*key);
+            }
+        }
+    }
+
     policy_ = std::move(next);
     policy_name_ = lower;
     return true;

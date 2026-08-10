@@ -4,11 +4,23 @@
 #include "third_party/nlohmann/json.hpp"
 #include "ttl.h"
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+
+// Per-key metadata that survives across policy switches so a rebuild can
+// preserve the eviction frontier instead of scattering it in hash order.
+struct KeyMeta {
+    std::string value;
+    std::size_t size = 0;                 // value.size(), cached for eviction sizing
+    uint64_t insert_seq = 0;              // global order of first insertion
+    uint64_t last_access_seq = 0;         // global order of last set/get (recency)
+    std::size_t freq = 0;                 // access count (for LFU)
+    bool visited = false;                 // SIEVE visited bit
+};
 
 class Storage {
 public:
@@ -26,7 +38,7 @@ private:
     void evict_if_over_limit();
     void expire_key(const std::string& key);
 
-    std::unordered_map<std::string, std::string> data_;
+    std::unordered_map<std::string, KeyMeta> data_;
     std::unique_ptr<EvictionPolicy> policy_;
     mutable std::mutex lock_;
     TTLManager ttl_;
@@ -36,4 +48,5 @@ private:
     std::string policy_name_ = "lru";
     std::size_t memory_limit_;
     bool preload_complete_ = false;
+    uint64_t access_seq_ = 0;             // monotonic counter for recency/frequency
 };

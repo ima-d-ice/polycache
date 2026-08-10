@@ -67,8 +67,9 @@ int main() {
         CHECK(st.switch_policy("sieVE") == true);
         CHECK(st.metrics()["policy"] == "sieve");
         CHECK(st.get("z").value() == "1");
-        // Same-policy switch still rebuilds (eviction order is scrambled by
-        // the map-order re-add) -- the rebuild-control probes rely on this.
+        // Same-policy switch rebuilds deterministically (ordered by recency /
+        // frequency / insertion order) -- the rebuild-control probes rely on
+        // the rebuild happening; frontier preservation is what closes the gap.
         CHECK(st.switch_policy("sieve") == true);
         CHECK(st.metrics()["policy"] == "sieve");
     }
