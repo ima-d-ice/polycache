@@ -692,8 +692,7 @@ def run_seed(args, seed, namespace_artifacts) -> list:
         args.aof_path = Path(args.aof_prefix + "_seed%d.aof" % seed)
         args.server_log = Path(args.aof_prefix + "_seed%d.log" % seed)
         args.access_log = Path(args.aof_prefix + "_seed%d.access.jsonl" % seed)
-        if args.agent_log is None:
-            args.agent_log = args.aof_prefix + "_seed%d.decisions.jsonl" % seed
+        args.agent_log = args.aof_prefix + "_seed%d.decisions.jsonl" % seed
 
     rng = random.Random(seed)
     keys = _key_names(args.working_set)
