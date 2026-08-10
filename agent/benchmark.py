@@ -41,6 +41,7 @@ import json
 import os
 import random
 import socket
+import statistics
 import subprocess
 import sys
 import time
@@ -71,7 +72,10 @@ MODES = ("static_lru", "static_lfu", "static_sieve", "pilot",
          "static_sieve_rebuild", "sieve_at_schedule", "lfu_at_schedule",
          "static_lfu_derange")
 PHASE_NAMES = {1: "zipf skew", 2: "hot+scan", 3: "mixed"}
-EXPECTED_POLICY = {1: "lfu", 2: "lfu", 3: "lfu"}
+# Accepted policies per phase -- P1 is LFU~SIEVE per the workload header, so
+# the pilot report must not mark an agent that correctly picked SIEVE as a
+# failure (2026-08-11 fix: was a bare "lfu", penalizing the optimal choice).
+EXPECTED_POLICY = {1: ("lfu", "sieve"), 2: "lfu", 3: "lfu"}
 POLICY_Y = {"lru": 0.0, "lfu": 1.0, "sieve": 2.0}
 DEFAULT_ALPHA = 1.2
 
@@ -459,12 +463,12 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
             phase_policy_start.setdefault(ph, policy)
             phase_policy_end[ph] = policy
             expected = EXPECTED_POLICY.get(ph)
-            # Detection = the agent SWITCHED INTO the expected policy during
+            # Detection = the agent SWITCHED INTO an expected policy during
             # this phase (switches are only visible at block granularity).
-            if (expected and policy == expected and
+            if (expected and policy in expected and
                     phase_switch_to_expected[ph] is None and
                     prev_sample_policy is not None and
-                    prev_sample_policy != policy):
+                    prev_sample_policy not in expected):
                 phase_switch_to_expected[ph] = end
             prev_sample_policy = policy
 
@@ -553,19 +557,20 @@ def print_pilot_report(results, cfg) -> None:
     print("  agent started on %s" % start_policy)
     for ph in (1, 2, 3):
         expected = EXPECTED_POLICY[ph]
+        expected_label = expected if isinstance(expected, str) else " or ".join(expected)
         start_policy = stats["phase_policy_start"].get(ph, "?")
         end_policy = stats["phase_policy_end"].get(ph, "?")
-        mark = "OK" if end_policy == expected else "X"
+        mark = "OK" if end_policy in expected else "X"
         detail = ""
         switch_at = stats["phase_switch_to_expected"][ph]
         if switch_at is not None:
             detail = " switched to %s at req %d (delay ~%d req from phase start)" % (
-                expected, switch_at, switch_at - stats["phase_start_req"][ph])
-        elif end_policy == expected:
-            detail = " (policy %s from phase start; no switch needed)" % expected
+                expected_label, switch_at, switch_at - stats["phase_start_req"][ph])
+        elif end_policy in expected:
+            detail = " (policy %s from phase start; no switch needed)" % end_policy
         else:
             detail = " (policy %s throughout; no switch to %s observed)" % (
-                start_policy, expected)
+                start_policy, expected_label)
         print("  agent was on %-5s during phase %d, ended on %-5s [%s]%s" %
               (start_policy, ph, end_policy, mark, detail))
     if not cfg.spawn_agent:
@@ -676,6 +681,94 @@ def plot_pilot(results, cfg) -> None:
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
+def run_seed(args, seed, namespace_artifacts) -> list:
+    """One full measurement round: generate the workload for `seed`, then
+    run every selected mode (fresh server per mode, agent spawned for
+    pilot).  Returns [(mode, samples, stats)].  With namespace_artifacts
+    (multi-seed runs) every artifact path gets a _seedN suffix so the
+    appended access telemetry and AOF never mix between seeds."""
+    if namespace_artifacts:
+        args.aof_path = Path(args.aof_prefix + "_seed%d.aof" % seed)
+        args.server_log = Path(args.aof_prefix + "_seed%d.log" % seed)
+        args.access_log = Path(args.aof_prefix + "_seed%d.access.jsonl" % seed)
+        if args.agent_log is None:
+            args.agent_log = args.aof_prefix + "_seed%d.decisions.jsonl" % seed
+
+    rng = random.Random(seed)
+    keys = _key_names(args.working_set)
+    rng.shuffle(keys)
+    workload = build_workload(keys, args.requests, rng, args)
+    preload_keys = keys
+
+    modes = MODES if args.mode == "all" else (args.mode,)
+    results = []
+    server = None
+    agent = None
+    telemetry_fh = None
+    try:
+        for mode in modes:
+            print("\n== mode %s ==" % mode)
+            server = start_server(args)
+            if mode == "pilot" and args.spawn_agent:
+                telemetry_fh = open(args.access_log, "a", encoding="utf-8")
+                agent = spawn_agent(args)
+                time.sleep(0.3)
+            samples, stats = run_mode(mode, workload, preload_keys, args,
+                                      telemetry_fh if mode == "pilot" else None)
+            results.append((mode, samples, stats))
+            if agent is not None:
+                agent.terminate()
+                try:
+                    agent.wait(2)
+                except subprocess.TimeoutExpired:
+                    agent.kill()
+                agent = None
+            if telemetry_fh is not None:
+                telemetry_fh.close()
+                telemetry_fh = None
+            stop_server(server)
+            server = None
+    finally:
+        stop_server(server)
+        if agent is not None:
+            agent.kill()
+        if telemetry_fh is not None:
+            telemetry_fh.close()
+    return results
+
+
+def print_aggregate(per_seed, cfg) -> None:
+    """Mean +- std across seeds, per mode, over the modes every seed ran."""
+    seeds = sorted(per_seed)
+    by_mode = {}
+    for mode in set().union(*[set(r[0] for r in per_seed[s])
+                              for s in seeds]):
+        if not all(any(r[0] == mode for r in per_seed[s]) for s in seeds):
+            continue
+        by_mode[mode] = {ph: [] for ph in (1, 2, 3)}
+        by_mode[mode]["overall"] = []
+        for s in seeds:
+            stats = next(r[2] for r in per_seed[s] if r[0] == mode)
+            for ph in (1, 2, 3):
+                by_mode[mode][ph].append(stats["phase_rates"][ph])
+            by_mode[mode]["overall"].append(stats["overall"])
+
+    def mv(xs):
+        return "%.4f +- %.4f" % (statistics.mean(xs),
+                                 statistics.stdev(xs) if len(xs) > 1 else 0.0)
+
+    print("\naggregated verdict across seeds %s (mean +- std):" % seeds)
+    header = ("%-12s | %16s | %16s | %16s | %14s" %
+              ("Mode", "P1 zipf skew", "P2 hot+scan", "P3 mixed", "Overall"))
+    print(header)
+    print("-" * len(header))
+    for mode in sorted(by_mode):
+        m = by_mode[mode]
+        print("%-12s | %16s | %16s | %16s | %14s" %
+              (mode, mv(m[1]), mv(m[2]), mv(m[3]), mv(m["overall"])))
+    print("-" * len(header))
+
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
@@ -818,51 +911,23 @@ def main(argv=None) -> int:
     if args.agent_log is None:
         args.agent_log = args.aof_prefix + ".decisions.jsonl"
 
-    rng = random.Random(args.seed)
-    keys = _key_names(args.working_set)
-    rng.shuffle(keys)
-    workload = build_workload(keys, args.requests, rng, args)
-    preload_keys = keys
+    seeds = args.seeds if args.seeds is not None else [args.seed]
+    per_seed = {}
+    for seed in seeds:
+        if seed is None:
+            seed = 7
+            args.seed = None  # time-seeded, matches previous single-run behavior
+        print("\n########## seed %d ##########" % seed)
+        results = run_seed(args, seed, namespace_artifacts=(len(seeds) > 1))
+        per_seed[seed] = results
+        print_summary(results, args)
+        print_pilot_report(results, args)
+        if len(seeds) == 1:
+            plot_hit_rates(results, args)
+            plot_pilot(results, args)
 
-    modes = MODES if args.mode == "all" else (args.mode,)
-    results = []
-    server = None
-    agent = None
-    telemetry_fh = None
-    try:
-        for mode in modes:
-            print("\n== mode %s ==" % mode)
-            server = start_server(args)
-            if mode == "pilot" and args.spawn_agent:
-                telemetry_fh = open(args.access_log, "a", encoding="utf-8")
-                agent = spawn_agent(args)
-                time.sleep(0.3)
-            samples, stats = run_mode(mode, workload, preload_keys, args,
-                                      telemetry_fh if mode == "pilot" else None)
-            results.append((mode, samples, stats))
-            if agent is not None:
-                agent.terminate()
-                try:
-                    agent.wait(2)
-                except subprocess.TimeoutExpired:
-                    agent.kill()
-                agent = None
-            if telemetry_fh is not None:
-                telemetry_fh.close()
-                telemetry_fh = None
-            stop_server(server)
-            server = None
-    finally:
-        stop_server(server)
-        if agent is not None:
-            agent.kill()
-        if telemetry_fh is not None:
-            telemetry_fh.close()
-
-    print_summary(results, args)
-    print_pilot_report(results, args)
-    plot_hit_rates(results, args)
-    plot_pilot(results, args)
+    if len(seeds) > 1:
+        print_aggregate(per_seed, args)
     return 0
 
 
