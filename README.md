@@ -125,7 +125,7 @@ curl -s http://127.0.0.1:8080/health
 
 ```sh
 python3 agent/benchmark.py --mode all --requests 90000 \
-    --cache-size-mb 1 --hot-size 11000 --seed 7
+    --cache-size-mb 1 --hot-size 11000 --seeds 1 7 42 123 999
 ```
 
 ### Eviction policies — 5-seed consistency (90K requests, 1 MB cache)
