@@ -3,7 +3,7 @@
 import math
 import statistics
 from collections import deque
-from typing import Deque, Dict, List
+from typing import Deque, Dict, List, Optional
 
 
 def _least_squares_slope(y: List[float]) -> float:
