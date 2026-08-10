@@ -67,9 +67,23 @@ int main() {
         CHECK(st.switch_policy("sieVE") == true);
         CHECK(st.metrics()["policy"] == "sieve");
         CHECK(st.get("z").value() == "1");
+        // Same-policy switch still rebuilds (eviction order is scrambled by
+        // the map-order re-add) -- the rebuild-control probes rely on this.
+        CHECK(st.switch_policy("sieve") == true);
+        CHECK(st.metrics()["policy"] == "sieve");
     }
 
-    // 4. TTL: value present before expiry, gone after.
+    // 4. mark_preloaded: flag is false by default, true after, in metrics.
+    {
+        Storage st;
+        CHECK(st.metrics()["preload_complete"] == false);
+        st.mark_preloaded();
+        CHECK(st.metrics()["preload_complete"] == true);
+        st.mark_preloaded();
+        CHECK(st.metrics()["preload_complete"] == true);
+    }
+
+    // 5. TTL: value present before expiry, gone after.
     //    ttl=2s, generous 2.5s sleep so name/thread timing never flakes.
     {
         Storage st;
@@ -79,6 +93,6 @@ int main() {
         CHECK(!st.get("tt").has_value());
     }
 
-    std::printf("ok storage (4 groups)\n");
+    std::printf("ok storage (5 groups)\n");
     return 0;
 }

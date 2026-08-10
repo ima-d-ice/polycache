@@ -65,6 +65,7 @@ class TuningAgent:
         cooldown_requests: int = 0,
         capacity_keys: int = 0,
         burst_keys: int = 0,
+        no_preload_gate: bool = False,
     ) -> None:
         self.cache_host = cache_host
         self.cache_port = cache_port
@@ -90,11 +91,16 @@ class TuningAgent:
         # a request-distance instead of seconds.
         self.decide_every = max(0, int(decide_every_requests))
         self.cooldown_requests = max(0, int(cooldown_requests))
+        self.no_preload_gate = bool(no_preload_gate)
         self._progress = 0
-        # Negative so the FIRST decision fires immediately (progress 0,
-        # before any workload traffic): the agent gets one chance to set
-        # the right policy from the preload state, matching the original
-        # wall-clock behavior where the first cycle ran pre-workload.
+        # Negative so the FIRST decision fires as soon as decide_every
+        # requests of traffic are observed after the preload gate opens
+        # (see run(): decisions are skipped until the server reports
+        # preload_complete, at which point the cadence restarts from the
+        # current progress).  Firing at progress 0 mid-preload was the
+        # 2026-08-10 artifact: a switch while the cache is still filling
+        # rebuilds the policy on a half-loaded map and scrambles the
+        # eviction frontier before any workload traffic.
         self._last_decide_progress = -self.decide_every
         self._switch_progress: Optional[int] = None
 
@@ -856,6 +862,19 @@ class TuningAgent:
         builder.add_edge("act", END)
         return builder.compile()
 
+    def _preload_complete(self) -> bool:
+        """True when the cache server reports preload done.
+
+        The benchmark sends MARK_PRELOADED right after the preload loop.
+        A missing flag (stale binary) reads as False so the gate errs on
+        the safe side; --no-preload-gate skips this check entirely.
+        """
+        try:
+            metrics = fetch_metrics(self.admin_host, self.admin_port)
+        except Exception:
+            return False
+        return bool(metrics.get("preload_complete", False))
+
     def run(self, interval_seconds: float = 5.0, max_cycles: int = -1) -> None:
         """Run the tuning loop until interrupted or max_cycles reached.
 
@@ -881,9 +900,35 @@ class TuningAgent:
                 self.decide_every,
                 self.cooldown_requests,
             )
-        poll_delay = 0.1 if self.decide_every > 0 else interval_seconds
+        # Benchmark mode polls fast so the request-quantized cadence fires
+        # within ~a poll interval of the grid position (ingest is a cheap
+        # tail read; 20 polls/s is negligible).
+        poll_delay = 0.05 if self.decide_every > 0 else interval_seconds
+        preload_gate_done = self.no_preload_gate or self.decide_every == 0
+        gated_cycles = 0
         while max_cycles < 0 or cycle < max_cycles:
             self._ingest_access_log()
+            if not preload_gate_done:
+                if not self._preload_complete():
+                    gated_cycles += 1
+                    if gated_cycles % 20 == 1:
+                        self.logger.warning(
+                            "waiting for cache preload to complete (send "
+                            "MARK_PRELOADED once the cache is filled; "
+                            "--no-preload-gate to skip this gate)")
+                    time.sleep(poll_delay)
+                    continue
+                # Preload done: restart the decision cadence from here so a
+                # fresh cache sees decide_every requests of real traffic
+                # before the first decision can fire.  Quantize to the
+                # decide grid: gate-open progress varies with poll timing
+                # (0..~decide_every requests), and un-quantized that jitter
+                # shifts the first switch position, which the policy-rebuild
+                # scramble amplifies into 0.5-1.2pt of hit-rate noise (the
+                # echo-control gap measured on the 2026-08-10 regen).
+                self._last_decide_progress = (
+                    self._progress - (self._progress % self.decide_every))
+                preload_gate_done = True
             if (self.decide_every > 0
                     and self._progress - self._last_decide_progress
                     < self.decide_every):
@@ -978,6 +1023,11 @@ def main() -> None:
                         help="burst pool size in keys (preload tail).  "
                              "Enables the eviction-physics signal used by "
                              "hybrid_conflict (0 = disabled)")
+    parser.add_argument("--no-preload-gate", action="store_true",
+                        help="skip the preload-complete gate (decide even "
+                             "while the cache is still filling; only for "
+                             "standalone runs that cannot send "
+                             "MARK_PRELOADED)")
     parser.add_argument("--hybrid-disagreement", default="stay",
                         choices=("stay", "rule", "llm"),
                         help="DEPRECATED no-op: hybrid is diagnostic-only, "
@@ -1004,6 +1054,7 @@ def main() -> None:
         cooldown_requests=args.cooldown_req,
         capacity_keys=args.capacity_keys,
         burst_keys=args.burst_keys,
+        no_preload_gate=args.no_preload_gate,
     )
     try:
         agent.run(args.interval, args.cycles)

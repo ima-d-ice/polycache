@@ -66,6 +66,13 @@ int main() {
         CHECK(c.args[0] == "sieve");
     }
 
+    // MARK_PRELOADED has no args, case-insensitive.
+    {
+        auto c = protocol::parse_command("mark_preloaded\r\n");
+        CHECK(c.type == Command::MARK_PRELOADED);
+        CHECK(c.args.empty());
+    }
+
     // Empty and whitespace-only lines parse to UNKNOWN with no args.
     {
         auto c1 = protocol::parse_command("");
@@ -83,6 +90,6 @@ int main() {
         CHECK(c.args.size() == 2);
     }
 
-    std::printf("ok protocol (8 groups)\n");
+    std::printf("ok protocol (9 groups)\n");
     return 0;
 }

@@ -92,7 +92,13 @@ nlohmann::json Storage::metrics() const {
     const auto total = static_cast<float>(hits_ + misses_);
     j["hit_rate"] = total > 0.0f ? static_cast<float>(hits_) / total : 0.0f;
     j["miss_rate"] = total > 0.0f ? static_cast<float>(misses_) / total : 0.0f;
+    j["preload_complete"] = preload_complete_;
     return j;
+}
+
+void Storage::mark_preloaded() {
+    lock_guard<mutex> lk(lock_);
+    preload_complete_ = true;
 }
 
 void Storage::evict_if_over_limit() {

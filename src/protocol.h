@@ -6,7 +6,7 @@
 namespace protocol {
 
 struct Command {
-    enum Type { SET, GET, DEL, METRICS, SWITCH_POLICY, UNKNOWN };
+    enum Type { SET, GET, DEL, METRICS, SWITCH_POLICY, MARK_PRELOADED, UNKNOWN };
     Type type = UNKNOWN;
     std::vector<std::string> args;
 };

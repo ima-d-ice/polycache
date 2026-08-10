@@ -52,7 +52,25 @@ from metrics import fetch_metrics
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 STATIC_POLICY = {"static_lru": "lru", "static_lfu": "lfu", "static_sieve": "sieve"}
-MODES = ("static_lru", "static_lfu", "static_sieve", "pilot")
+# Rebuild-control modes (2026-08-10): pin a policy and re-issue
+# SWITCH_POLICY at fixed request positions to replicate the agent's rebuild
+# scrambles WITHOUT changing policy.  Every switch rebuilds the policy by
+# re-adding all keys in unordered_map hash order, which randomizes the
+# eviction frontier -- the artifact that inflated the rule-vs-static gap.
+# These modes attribute the agent's edge between policy choice and
+# frontier scramble.  AGENT_SWITCH_POINTS = pilot rule-mode switch
+# positions on seed 1 (probe 2026-08-10: 6744/21744/37248/52496/78496,
+# incl. rollback-triggered switches); per-seed positions vary.
+AGENT_SWITCH_POINTS = (7000, 22000, 37000, 52000, 78500)
+REBUILD_CONTROL = {
+    "static_sieve_rebuild": ("sieve", (7000,)),           # single early rebuild
+    "sieve_at_schedule":    ("sieve", AGENT_SWITCH_POINTS),
+    "lfu_at_schedule":      ("lfu", AGENT_SWITCH_POINTS),
+    "static_lfu_derange":   ("lfu", tuple(range(15000, 90000, 15000))),
+}
+MODES = ("static_lru", "static_lfu", "static_sieve", "pilot",
+         "static_sieve_rebuild", "sieve_at_schedule", "lfu_at_schedule",
+         "static_lfu_derange")
 PHASE_NAMES = {1: "zipf skew", 2: "hot+scan", 3: "mixed"}
 EXPECTED_POLICY = {1: "lfu", 2: "lfu", 3: "lfu"}
 POLICY_Y = {"lru": 0.0, "lfu": 1.0, "sieve": 2.0}
@@ -388,10 +406,15 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
         sock.settimeout(10)
         ls = LineSocket(sock)
 
-        if name in STATIC_POLICY:
-            if not switch_policy(ls, STATIC_POLICY[name]):
+        pinned = STATIC_POLICY.get(name)
+        rebuild_at = frozenset()
+        if pinned is None and name in REBUILD_CONTROL:
+            pinned, rebuild_at = REBUILD_CONTROL[name]
+        if pinned is not None:
+            if not switch_policy(ls, pinned):
                 raise RuntimeError("%s: SWITCH_POLICY %s rejected" %
-                                   (name, STATIC_POLICY[name]))
+                                   (name, pinned))
+        rebuild_count = 0
 
         # Preload exactly the cache's capacity in keys: hot pool + burst
         # pool + a slice of the scan pool, shuffled.  Nothing is evicted
@@ -402,6 +425,13 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
         preload_order = preload_keys[:cap]
         for key in preload_order:
             set_value(ls, key, "x" * cfg.value_size)
+        # Preload-done gate: the agent must not decide while the cache is
+        # still filling (progress only counts GETs, so an early poll would
+        # otherwise fire a switch mid-preload, scrambling the eviction
+        # frontier before any workload traffic -- the 2026-08-10 artifact).
+        reply = ls.command(b"MARK_PRELOADED")
+        if reply != b"+OK":
+            raise RuntimeError("MARK_PRELOADED -> %r" % reply)
 
         ev_before = int(fetch_metrics(cfg.admin_host, cfg.admin_port)
                         .get("evictions", 0))
@@ -410,6 +440,13 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
             end = min(start + cfg.block_size, n)
             times = []
             for i in range(start, end):
+                if i in rebuild_at:
+                    reply = ls.command(b"SWITCH_POLICY " + pinned.encode())
+                    if reply != b"+OK":
+                        raise RuntimeError(
+                            "rebuild %s: SWITCH_POLICY %s -> %r" %
+                            (name, pinned, reply))
+                    rebuild_count += 1
                 op, key = workload[i]
                 ph = phase_of(i, n)
                 t0 = time.perf_counter()
