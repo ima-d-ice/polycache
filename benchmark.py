@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""AdaptiCache workload benchmark with real eviction pressure.
+"""PolyCache workload benchmark with real eviction pressure.
 
-Starts a FRESH AdaptiCache server for every mode (kills any running
-adapticache, restarts with --memory-limit <cache-size-mb> and a clean
+Starts a FRESH PolyCache server for every mode (kills any running
+polycache, restarts with --memory-limit <cache-size-mb> and a clean
 temporary AOF), preloads a working set much larger than the cache, then
 runs three workload phases that force eviction DURING measurement:
 
@@ -264,15 +264,15 @@ def switch_policy(ls: LineSocket, policy: str) -> bool:
 # --------------------------------------------------------------------------
 
 def kill_server() -> None:
-    proc = subprocess.run(["pkill", "-x", "adapticache"],
+    proc = subprocess.run(["pkill", "-x", "polycache"],
                           capture_output=True, text=True)
     if proc.returncode == 0:
-        print("killed existing adapticache process")
+        print("killed existing polycache process")
     time.sleep(0.25)
 
 
 def start_server(cfg):
-    """Kill any adapticache, start a fresh one with a small memory limit."""
+    """Kill any polycache, start a fresh one with a small memory limit."""
     kill_server()
     if not cfg.server_path.exists():
         print("server binary not found: %s (run 'make' first)" % cfg.server_path,
@@ -488,7 +488,7 @@ def plot_hit_rates(results, cfg) -> None:
     ax.set_xlabel("requests issued")
     ax.set_ylabel("hit rate (overall)")
     ax.set_ylim(0.0, 1.05)
-    ax.set_title("AdaptiCache hit rate vs requests "
+    ax.set_title("PolyCache hit rate vs requests "
                  "(fresh %dMB server per mode)" % cfg.cache_size_mb)
     ax.legend()
     fig.tight_layout()
@@ -568,7 +568,7 @@ def print_aggregate(per_seed, cfg) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="AdaptiCache benchmark: fresh per-mode server, phased "
+        description="PolyCache benchmark: fresh per-mode server, phased "
                     "workload with real eviction pressure, policy comparison.")
     parser.add_argument("--mode", default="all", choices=MODES + ("all",))
     parser.add_argument("--requests", type=int, default=50000)
@@ -624,8 +624,8 @@ def main(argv=None) -> int:
                              "42 123 999): per-seed compare runs, then an "
                              "aggregated mean +- std verdict.  Defaults to a "
                              "single seed (--seed or 7).")
-    parser.add_argument("--server-path", default=str(SCRIPT_DIR / "adapticache"))
-    parser.add_argument("--aof-prefix", default="/tmp/adaptivecache_bench")
+    parser.add_argument("--server-path", default=str(SCRIPT_DIR / "polycache"))
+    parser.add_argument("--aof-prefix", default="/tmp/polycache_bench")
     parser.add_argument("--wait-timeout", type=float, default=10.0)
     parser.add_argument("--plot-prefix", default="")
     args = parser.parse_args(argv)

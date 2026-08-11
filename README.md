@@ -1,4 +1,4 @@
-# AdaptiCache
+# PolyCache
 
 An in-memory cache server written in C++17 with runtime-switchable eviction policies. A single `SWITCH_POLICY` command swaps between SIEVE, LRU, and LFU live — no restart, no downtime.
 
@@ -75,14 +75,14 @@ A `SWITCH_POLICY` command tells `Storage` to rebuild its eviction index under th
 ## Quick Start
 
 ```sh
-make                 # builds ./adapticache
+make                 # builds ./polycache
 make test            # builds + runs the unit tests (all green)
 
-./adapticache [--port PORT] [--admin-port PORT] \
+./polycache [--port PORT] [--admin-port PORT] \
              [--memory-limit MB] [--aof-file FILE]
 ```
 
-Defaults: cache port `6379`, admin port `8080`, memory limit `64` MB, AOF file `adapticache.aof`. `SIGINT`/`SIGTERM` trigger graceful shutdown. Builds on Linux (real epoll) and macOS (compatibility shim in `src/epoll_compat.h`).
+Defaults: cache port `6379`, admin port `8080`, memory limit `64` MB, AOF file `polycache.aof`. `SIGINT`/`SIGTERM` trigger graceful shutdown. Builds on Linux (real epoll) and macOS (compatibility shim in `src/epoll_compat.h`).
 
 ## Protocol & API
 
@@ -115,7 +115,7 @@ curl -s http://127.0.0.1:8080/health
 
 ## Benchmarks
 
-`benchmark.py` (Python 3, stdlib + matplotlib for the plot) starts a fresh `adapticache` for every mode, preloads exactly the cache's key capacity, and replays one generated workload so every policy measures the same request sequence.
+`benchmark.py` (Python 3, stdlib + matplotlib for the plot) starts a fresh `polycache` for every mode, preloads exactly the cache's key capacity, and replays one generated workload so every policy measures the same request sequence.
 
 ```sh
 venv/bin/python3 benchmark.py --mode all --requests 90000 \

@@ -1,7 +1,7 @@
 *.o
 *.d
 *.aof
-adapticache
+polycache
 test_sieve
 test_protocol
 test_storage
