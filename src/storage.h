@@ -31,7 +31,6 @@ public:
     std::optional<std::string> get(const std::string& key);
     bool del(const std::string& key);
     bool switch_policy(const std::string& name);
-    void mark_preloaded();
     nlohmann::json metrics() const;
 
 private:
@@ -47,6 +46,5 @@ private:
     std::size_t evictions_ = 0;
     std::string policy_name_ = "lru";
     std::size_t memory_limit_;
-    bool preload_complete_ = false;
     uint64_t access_seq_ = 0;             // monotonic counter for recency/frequency
 };

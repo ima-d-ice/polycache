@@ -347,9 +347,6 @@ string Server::execute_command(const string& line) {
             const bool ok = storage_->switch_policy(cmd.args[0]);
             return ok ? "+OK" : "-ERR unknown policy: " + cmd.args[0];
         }
-        case protocol::Command::MARK_PRELOADED:
-            storage_->mark_preloaded();
-            return "+OK";
         case protocol::Command::UNKNOWN:
         default:
             return "-ERR unknown command";

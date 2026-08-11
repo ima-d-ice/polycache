@@ -68,8 +68,6 @@ Command parse_command(const string& line) {
         cmd.type = Command::METRICS;
     } else if (verb == "SWITCH_POLICY") {
         cmd.type = Command::SWITCH_POLICY;
-    } else if (verb == "MARK_PRELOADED") {
-        cmd.type = Command::MARK_PRELOADED;
     } else {
         cmd.type = Command::UNKNOWN;
     }

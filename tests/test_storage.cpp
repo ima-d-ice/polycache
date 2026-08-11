@@ -68,23 +68,12 @@ int main() {
         CHECK(st.metrics()["policy"] == "sieve");
         CHECK(st.get("z").value() == "1");
         // Same-policy switch rebuilds deterministically (ordered by recency /
-        // frequency / insertion order) -- the rebuild-control probes rely on
-        // the rebuild happening; frontier preservation is what closes the gap.
+        // frequency / insertion order) and preserves the eviction frontier.
         CHECK(st.switch_policy("sieve") == true);
         CHECK(st.metrics()["policy"] == "sieve");
     }
 
-    // 4. mark_preloaded: flag is false by default, true after, in metrics.
-    {
-        Storage st;
-        CHECK(st.metrics()["preload_complete"] == false);
-        st.mark_preloaded();
-        CHECK(st.metrics()["preload_complete"] == true);
-        st.mark_preloaded();
-        CHECK(st.metrics()["preload_complete"] == true);
-    }
-
-    // 5. TTL: value present before expiry, gone after.
+    // 4. TTL: value present before expiry, gone after.
     //    ttl=2s, generous 2.5s sleep so name/thread timing never flakes.
     {
         Storage st;
@@ -94,6 +83,6 @@ int main() {
         CHECK(!st.get("tt").has_value());
     }
 
-    std::printf("ok storage (5 groups)\n");
+    std::printf("ok storage (4 groups)\n");
     return 0;
 }

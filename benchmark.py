@@ -2,7 +2,7 @@
 """AdaptiCache workload benchmark with real eviction pressure.
 
 Starts a FRESH AdaptiCache server for every mode (kills any running
-adapti_cache, restarts with --memory-limit <cache-size-mb> and a clean
+adapticache, restarts with --memory-limit <cache-size-mb> and a clean
 temporary AOF), preloads a working set much larger than the cache, then
 runs three workload phases that force eviction DURING measurement:
 
@@ -13,8 +13,7 @@ runs three workload phases that force eviction DURING measurement:
                      hot zipfian GETs and a round-robin scan of the
                      resident middle band.
   phase 3 (60-100%): mixed - first half repeats phase 1, second half
-                     repeats phase 2.  This is the phase the tuning agent
-                     is expected to react in.
+                     repeats phase 2.
 
 The burst pool is the last keys the cache was filled with.  Each phase
 reads them once at the start; the keys then idle for the rest of the
@@ -27,9 +26,9 @@ burst read exposes the difference.  Writes are cold inserts of keys
 phase without writes would be frozen at preload and measure identically
 for every policy -- every phase keeps a write stream alive on purpose.
 
-Modes: static_lru / static_lfu / static_sieve pin the policy; pilot runs
-the tuning agent (agent.py, optionally spawned with --spawn-agent) which
-reads the access telemetry this tool writes and switches policies.
+Modes: static_lru / static_lfu / static_sieve pin the policy for the
+whole run; the policy switch is issued once via SWITCH_POLICY before the
+workload starts.
 
 All numbers come from live TCP/HTTP exchanges with the server.  Nothing is
 fabricated: if the server binary is missing or does not come up, the tool
@@ -45,39 +44,21 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
-
-from metrics import fetch_metrics
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 STATIC_POLICY = {"static_lru": "lru", "static_lfu": "lfu", "static_sieve": "sieve"}
-# Rebuild-control modes (2026-08-10): pin a policy and re-issue
-# SWITCH_POLICY at fixed request positions to replicate the agent's rebuild
-# scrambles WITHOUT changing policy.  Every switch rebuilds the policy by
-# re-adding all keys in unordered_map hash order, which randomizes the
-# eviction frontier -- the artifact that inflated the rule-vs-static gap.
-# These modes attribute the agent's edge between policy choice and
-# frontier scramble.  AGENT_SWITCH_POINTS = pilot rule-mode switch
-# positions on seed 1 (probe 2026-08-10: 6744/21744/37248/52496/78496,
-# incl. rollback-triggered switches); per-seed positions vary.
-AGENT_SWITCH_POINTS = (7000, 22000, 37000, 52000, 78500)
-REBUILD_CONTROL = {
-    "static_sieve_rebuild": ("sieve", (7000,)),           # single early rebuild
-    "sieve_at_schedule":    ("sieve", AGENT_SWITCH_POINTS),
-    "lfu_at_schedule":      ("lfu", AGENT_SWITCH_POINTS),
-    "static_lfu_derange":   ("lfu", tuple(range(15000, 90000, 15000))),
-}
-MODES = ("static_lru", "static_lfu", "static_sieve", "pilot",
-         "static_sieve_rebuild", "sieve_at_schedule", "lfu_at_schedule",
-         "static_lfu_derange")
-PHASE_NAMES = {1: "zipf skew", 2: "hot+scan", 3: "mixed"}
-# Accepted policies per phase -- P1 is LFU~SIEVE per the workload header, so
-# the pilot report must not mark an agent that correctly picked SIEVE as a
-# failure (2026-08-11 fix: was a bare "lfu", penalizing the optimal choice).
-EXPECTED_POLICY = {1: ("lfu", "sieve"), 2: "lfu", 3: "lfu"}
-POLICY_Y = {"lru": 0.0, "lfu": 1.0, "sieve": 2.0}
+MODES = ("static_lru", "static_lfu", "static_sieve")
 DEFAULT_ALPHA = 1.2
+
+
+def fetch_metrics(host: str, port: int, timeout: float = 2.0) -> dict:
+    """GET /metrics from the admin server and return the JSON as a dict."""
+    with urllib.request.urlopen(
+            "http://%s:%d/metrics" % (host, port), timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
 
 
 # --------------------------------------------------------------------------
@@ -283,15 +264,15 @@ def switch_policy(ls: LineSocket, policy: str) -> bool:
 # --------------------------------------------------------------------------
 
 def kill_server() -> None:
-    proc = subprocess.run(["pkill", "-x", "adapti_cache"],
+    proc = subprocess.run(["pkill", "-x", "adapticache"],
                           capture_output=True, text=True)
     if proc.returncode == 0:
-        print("killed existing adapti_cache process")
+        print("killed existing adapticache process")
     time.sleep(0.25)
 
 
 def start_server(cfg):
-    """Kill any adapti_cache, start a fresh one with a small memory limit."""
+    """Kill any adapticache, start a fresh one with a small memory limit."""
     kill_server()
     if not cfg.server_path.exists():
         print("server binary not found: %s (run 'make' first)" % cfg.server_path,
@@ -344,26 +325,11 @@ def stop_server(proc) -> None:
     print("server stopped")
 
 
-def spawn_agent(cfg):
-    """Start the rule agent attached to the fresh server + access telemetry."""
-    cmd = [sys.executable, str(SCRIPT_DIR / "agent.py"),
-           "--cache-host", cfg.cache_host, "--cache-port", str(cfg.cache_port),
-           "--admin-host", cfg.admin_host, "--admin-port", str(cfg.admin_port),
-           "--cooldown", str(cfg.agent_cooldown),
-           "--interval", str(cfg.agent_interval),
-           "--decide-every", str(cfg.decide_every),
-           "--cooldown-req", str(cfg.cooldown_req),
-           "--access-log", str(cfg.access_log),
-           "--log", str(cfg.agent_log)]
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
-
-
 # --------------------------------------------------------------------------
 # Measurement
 # --------------------------------------------------------------------------
 
-def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
+def run_mode(name, workload, preload_keys, cfg):
     """Run one benchmark mode against the (already started) server.
 
     preload_keys arrive shuffled: the survivors of the oversize preload are
@@ -376,14 +342,10 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
     phase_start_req = {1: 0, 2: n // 3, 3: 2 * (n // 3)}
     phase_hits = {1: 0, 2: 0, 3: 0}
     phase_gets = {1: 0, 2: 0, 3: 0}
-    phase_policy_start = {}
-    phase_policy_end = {}
-    phase_switch_to_expected = {1: None, 2: None, 3: None}
     total_hits = 0
     total_gets = 0
     switches = 0
     prev_policy = None
-    prev_sample_policy = None
     peak_memory = 0
     samples = []
 
@@ -393,14 +355,10 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
         ls = LineSocket(sock)
 
         pinned = STATIC_POLICY.get(name)
-        rebuild_at = frozenset()
-        if pinned is None and name in REBUILD_CONTROL:
-            pinned, rebuild_at = REBUILD_CONTROL[name]
         if pinned is not None:
             if not switch_policy(ls, pinned):
                 raise RuntimeError("%s: SWITCH_POLICY %s rejected" %
                                    (name, pinned))
-        rebuild_count = 0
 
         # Preload exactly the cache's capacity in keys: hot pool + burst
         # pool + a slice of the scan pool, shuffled.  Nothing is evicted
@@ -411,13 +369,6 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
         preload_order = preload_keys[:cap]
         for key in preload_order:
             set_value(ls, key, "x" * cfg.value_size)
-        # Preload-done gate: the agent must not decide while the cache is
-        # still filling (progress only counts GETs, so an early poll would
-        # otherwise fire a switch mid-preload, scrambling the eviction
-        # frontier before any workload traffic -- the 2026-08-10 artifact).
-        reply = ls.command(b"MARK_PRELOADED")
-        if reply != b"+OK":
-            raise RuntimeError("MARK_PRELOADED -> %r" % reply)
 
         ev_before = int(fetch_metrics(cfg.admin_host, cfg.admin_port)
                         .get("evictions", 0))
@@ -426,13 +377,6 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
             end = min(start + cfg.block_size, n)
             times = []
             for i in range(start, end):
-                if i in rebuild_at:
-                    reply = ls.command(b"SWITCH_POLICY " + pinned.encode())
-                    if reply != b"+OK":
-                        raise RuntimeError(
-                            "rebuild %s: SWITCH_POLICY %s -> %r" %
-                            (name, pinned, reply))
-                    rebuild_count += 1
                 op, key = workload[i]
                 ph = phase_of(i, n)
                 t0 = time.perf_counter()
@@ -447,10 +391,6 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
                     if ok:
                         total_hits += 1
                         phase_hits[ph] += 1
-                if telemetry_fh is not None:
-                    telemetry_fh.write(json.dumps({"op": op, "key": key}) + "\n")
-            if telemetry_fh is not None:
-                telemetry_fh.flush()
 
             metrics = fetch_metrics(cfg.admin_host, cfg.admin_port)
             policy = str(metrics.get("policy", ""))
@@ -460,18 +400,6 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
             peak_memory = max(peak_memory, int(metrics.get("memory_bytes", 0)))
 
             ph = phase_of(end - 1, n)
-            phase_policy_start.setdefault(ph, policy)
-            phase_policy_end[ph] = policy
-            expected = EXPECTED_POLICY.get(ph)
-            # Detection = the agent SWITCHED INTO an expected policy during
-            # this phase (switches are only visible at block granularity).
-            if (expected and policy in expected and
-                    phase_switch_to_expected[ph] is None and
-                    prev_sample_policy is not None and
-                    prev_sample_policy not in expected):
-                phase_switch_to_expected[ph] = end
-            prev_sample_policy = policy
-
             phase_hit_rate = (phase_hits[ph] / phase_gets[ph]
                               if phase_gets[ph] else 0.0)
             samples.append({
@@ -498,21 +426,16 @@ def run_mode(name, workload, preload_keys, cfg, telemetry_fh):
         "evictions": evictions,
         "peak_memory": peak_memory,
         "switches": switches,
-        "phase_policy_start": phase_policy_start,
-        "phase_policy_end": phase_policy_end,
-        "phase_switch_to_expected": phase_switch_to_expected,
         "phase_start_req": phase_start_req,
     }
     return samples, stats
 
 
 # --------------------------------------------------------------------------
-# Output: summary table + pilot report + plots
+# Output: summary table + plots
 # --------------------------------------------------------------------------
 
 def print_summary(results, cfg) -> None:
-    print("\nexpected best policy per phase:   P1 LFU~SIEVE | P2 LFU | "
-          "P3 LFU (post-switch)\n")
     header = ("%-12s | %17s | %17s | %17s | %8s" %
               ("Mode", "P1 zipf skew", "P2 hot+scan", "P3 mixed", "Overall"))
     print(header)
@@ -547,37 +470,6 @@ def print_summary(results, cfg) -> None:
                   "SIEVE: %.4f" % (ph, label, rates[0], rates[1], rates[2]))
 
 
-def print_pilot_report(results, cfg) -> None:
-    pilot = [r for r in results if r[0] == "pilot"]
-    if not pilot:
-        return
-    stats = pilot[0][2]
-    print("\npilot (agent) report:")
-    start_policy = stats["phase_policy_start"].get(1, "?")
-    print("  agent started on %s" % start_policy)
-    for ph in (1, 2, 3):
-        expected = EXPECTED_POLICY[ph]
-        expected_label = expected if isinstance(expected, str) else " or ".join(expected)
-        start_policy = stats["phase_policy_start"].get(ph, "?")
-        end_policy = stats["phase_policy_end"].get(ph, "?")
-        mark = "OK" if end_policy in expected else "X"
-        detail = ""
-        switch_at = stats["phase_switch_to_expected"][ph]
-        if switch_at is not None:
-            detail = " switched to %s at req %d (delay ~%d req from phase start)" % (
-                expected_label, switch_at, switch_at - stats["phase_start_req"][ph])
-        elif end_policy in expected:
-            detail = " (policy %s from phase start; no switch needed)" % end_policy
-        else:
-            detail = " (policy %s throughout; no switch to %s observed)" % (
-                start_policy, expected_label)
-        print("  agent was on %-5s during phase %d, ended on %-5s [%s]%s" %
-              (start_policy, ph, end_policy, mark, detail))
-    if not cfg.spawn_agent:
-        print("  (agent was not spawned by the benchmark; run agent.py "
-              "manually with --access-log %s --cooldown <small>" % cfg.access_log)
-
-
 def plot_hit_rates(results, cfg) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -606,93 +498,19 @@ def plot_hit_rates(results, cfg) -> None:
     print("saved %s" % out)
 
 
-def _agent_decisions(path):
-    decisions = []
-    if not path:
-        return decisions
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                decisions.append(json.loads(line))
-    except OSError as exc:
-        print("warning: cannot read agent log %s (%s)" % (path, exc),
-              file=sys.stderr)
-    return decisions
-
-
-def plot_pilot(results, cfg) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    pilot = [r for r in results if r[0] == "pilot"]
-    if not pilot:
-        return
-    samples = pilot[0][1]
-    if not samples:
-        return
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-    xs = [s["requests"] for s in samples]
-    ys = [POLICY_Y.get(s["policy"], -1) for s in samples]
-    ax.step(xs, ys, where="post", label="policy")
-    ax.set_yticks(list(POLICY_Y.values()))
-    ax.set_yticklabels(list(POLICY_Y.keys()))
-    ax.set_xlabel("requests issued")
-    ax.set_ylabel("eviction policy")
-    ax.set_title("Pilot mode: agent policy switches")
-
-    switch_points = []
-    for i in range(1, len(samples)):
-        if samples[i]["policy"] != samples[i - 1]["policy"]:
-            switch_points.append(i)
-
-    decisions = _agent_decisions(cfg.agent_log)
-    for idx in switch_points:
-        x = samples[idx]["requests"]
-        new_policy = samples[idx]["policy"]
-        label = "switch -> %s" % new_policy
-        for d in decisions:
-            if d.get("new_policy") == new_policy:
-                reason = str(d.get("reason", ""))[:60]
-                label = "%s -> %s\n%s" % (d.get("old_policy", "?"),
-                                          d.get("new_policy", "?"), reason)
-                break
-        ax.axvline(x, color="tab:red", alpha=0.5, linestyle="--")
-        ax.annotate(label, xy=(x, POLICY_Y.get(new_policy, 0.0)),
-                    xytext=(x, 2.35), rotation=45, fontsize=7,
-                    ha="right", va="top")
-    if not switch_points:
-        ax.text(0.5, 0.5,
-                "no policy switches observed -- is agent.py running?",
-                transform=ax.transAxes, ha="center", fontsize=10,
-                color="tab:red")
-
-    fig.tight_layout()
-    out = "%spilot_decisions.png" % cfg.plot_prefix
-    fig.savefig(out)
-    plt.close(fig)
-    print("saved %s" % out)
-
-
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
 def run_seed(args, seed, namespace_artifacts) -> list:
     """One full measurement round: generate the workload for `seed`, then
-    run every selected mode (fresh server per mode, agent spawned for
-    pilot).  Returns [(mode, samples, stats)].  With namespace_artifacts
-    (multi-seed runs) every artifact path gets a _seedN suffix so the
-    appended access telemetry and AOF never mix between seeds."""
+    run every selected mode (fresh server per mode).  Returns
+    [(mode, samples, stats)].  With namespace_artifacts (multi-seed runs)
+    every artifact path gets a _seedN suffix so the AOF and logs never mix
+    between seeds."""
     if namespace_artifacts:
         args.aof_path = Path(args.aof_prefix + "_seed%d.aof" % seed)
         args.server_log = Path(args.aof_prefix + "_seed%d.log" % seed)
-        args.access_log = Path(args.aof_prefix + "_seed%d.access.jsonl" % seed)
-        args.agent_log = args.aof_prefix + "_seed%d.decisions.jsonl" % seed
 
     rng = random.Random(seed)
     keys = _key_names(args.working_set)
@@ -703,37 +521,16 @@ def run_seed(args, seed, namespace_artifacts) -> list:
     modes = MODES if args.mode == "all" else (args.mode,)
     results = []
     server = None
-    agent = None
-    telemetry_fh = None
     try:
         for mode in modes:
             print("\n== mode %s ==" % mode)
             server = start_server(args)
-            if mode == "pilot" and args.spawn_agent:
-                telemetry_fh = open(args.access_log, "a", encoding="utf-8")
-                agent = spawn_agent(args)
-                time.sleep(0.3)
-            samples, stats = run_mode(mode, workload, preload_keys, args,
-                                      telemetry_fh if mode == "pilot" else None)
+            samples, stats = run_mode(mode, workload, preload_keys, args)
             results.append((mode, samples, stats))
-            if agent is not None:
-                agent.terminate()
-                try:
-                    agent.wait(2)
-                except subprocess.TimeoutExpired:
-                    agent.kill()
-                agent = None
-            if telemetry_fh is not None:
-                telemetry_fh.close()
-                telemetry_fh = None
             stop_server(server)
             server = None
     finally:
         stop_server(server)
-        if agent is not None:
-            agent.kill()
-        if telemetry_fh is not None:
-            telemetry_fh.close()
     return results
 
 
@@ -827,27 +624,9 @@ def main(argv=None) -> int:
                              "42 123 999): per-seed compare runs, then an "
                              "aggregated mean +- std verdict.  Defaults to a "
                              "single seed (--seed or 7).")
-    parser.add_argument("--server-path", default=str(SCRIPT_DIR.parent / "adapticache"))
+    parser.add_argument("--server-path", default=str(SCRIPT_DIR / "adapticache"))
     parser.add_argument("--aof-prefix", default="/tmp/adaptivecache_bench")
     parser.add_argument("--wait-timeout", type=float, default=10.0)
-    parser.add_argument("--agent-log", default=None,
-                        help="agent decision JSONL for plot annotations")
-    parser.add_argument("--spawn-agent", action="store_true",
-                        help="start agent.py for the pilot mode")
-    parser.add_argument("--agent-cooldown", type=float, default=1.0)
-    parser.add_argument("--agent-interval", type=float, default=1.0)
-    parser.add_argument("--decide-every", type=int, default=5000,
-                        help="agent decides at fixed workload positions "
-                             "(every N requests, counted from the access "
-                             "telemetry) instead of wall-clock intervals -- "
-                             "removes run-to-run timing jitter so compare "
-                             "sub-runs measure identically (0 = wall-clock)")
-    parser.add_argument("--cooldown-req", type=int, default=12000,
-                        help="agent post-switch cooldown in requests (0 = "
-                             "use --agent-cooldown seconds).  Default > "
-                             "--decide-every so the cooldown actually "
-                             "throttles: a switch can be undone at most "
-                             "every ~2-3 decisions.")
     parser.add_argument("--plot-prefix", default="")
     args = parser.parse_args(argv)
 
@@ -906,9 +685,6 @@ def main(argv=None) -> int:
     args.server_path = Path(args.server_path)
     args.aof_path = Path(args.aof_prefix + ".aof")
     args.server_log = Path(args.aof_prefix + ".log")
-    args.access_log = Path(args.aof_prefix + ".access.jsonl")
-    if args.agent_log is None:
-        args.agent_log = args.aof_prefix + ".decisions.jsonl"
 
     seeds = args.seeds if args.seeds is not None else [args.seed]
     per_seed = {}
@@ -920,10 +696,8 @@ def main(argv=None) -> int:
         results = run_seed(args, seed, namespace_artifacts=(len(seeds) > 1))
         per_seed[seed] = results
         print_summary(results, args)
-        print_pilot_report(results, args)
         if len(seeds) == 1:
             plot_hit_rates(results, args)
-            plot_pilot(results, args)
 
     if len(seeds) > 1:
         print_aggregate(per_seed, args)
