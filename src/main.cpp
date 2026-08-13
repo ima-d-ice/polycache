@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -28,7 +29,7 @@ void handle_signal(int) {
 void print_usage(const char* prog) {
     cerr << "usage: " << prog
          << " [--port PORT] [--admin-port PORT] [--memory-limit MB] "
-            "[--aof-file FILE]\n";
+             "[--aof-file FILE] [--no-aof]\n";
 }
 
 }  // namespace
@@ -38,6 +39,7 @@ int main(int argc, char** argv) {
     int admin_port = 8080;
     size_t memory_mb = 64;
     string aof_file = "polycache.aof";
+    bool use_aof = true;
 
     for (int i = 1; i < argc; ++i) {
         const string arg = argv[i];
@@ -57,6 +59,8 @@ int main(int argc, char** argv) {
                 memory_mb = static_cast<size_t>(stoul(next_value(arg)));
             } else if (arg == "--aof-file") {
                 aof_file = next_value(arg);
+            } else if (arg == "--no-aof") {
+                use_aof = false;
             } else if (arg == "--help" || arg == "-h") {
                 print_usage(argv[0]);
                 return 0;
@@ -72,10 +76,13 @@ int main(int argc, char** argv) {
     }
 
     Storage storage(memory_mb * 1024 * 1024);
-    AOFLogger aof(aof_file);
-    aof.replay(&storage);
+    std::unique_ptr<AOFLogger> aof;
+    if (use_aof) {
+        aof = std::make_unique<AOFLogger>(aof_file);
+        aof->replay(&storage);
+    }
 
-    Server server(port, &storage, &aof);
+    Server server(port, &storage, aof.get());
     AdminServer admin(admin_port, &storage);
 
     struct sigaction sa {};

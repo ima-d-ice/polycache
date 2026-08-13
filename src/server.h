@@ -5,6 +5,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "protocol.h"
+
 class Storage;
 class AOFLogger;
 
@@ -24,12 +26,12 @@ private:
 
     void accept_connections();
     void handle_readable(int fd);
-    void process_lines(int fd);
+    void process_frames(int fd);
     void queue_response(int fd, const std::string& response);
     void try_send(int fd);
     void update_watch(int fd);
     void close_client(int fd);
-    std::string execute_command(const std::string& line);
+    std::string execute_command(const protocol::Command& cmd);
 
     int port_;
     Storage* storage_;

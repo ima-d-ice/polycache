@@ -35,22 +35,58 @@ make test
 
 ## Protocol & API Reference
 
-The server uses a simple, case-insensitive text protocol over TCP (terminated by `\r\n`).
+PolyCache speaks **two protocols on the same TCP port** (default `6379`, the
+Redis port). Request detection is per-frame: a frame beginning with `*` is
+parsed as **RESP2** (Redis Serialization Protocol — arrays of binary-safe bulk
+strings, pipelines supported); anything else falls back to the legacy
+line protocol (`VERB arg arg\r\n`). Both produce identical RESP-shaped
+responses, so the server is a drop-in target for `redis-benchmark` and
+`redis-cli`.
 
 ### TCP Commands
 
-| Command | Response |
-| :--- | :--- |
-| `SET key value [ttl]` | `+OK` |
-| `GET key` | `$<len>\r\n<value>` (hit) or `$-1` (miss) |
-| `DEL key` | `:1` (removed) or `:0` (absent) |
-| `SWITCH_POLICY lru\|lfu\|sieve` | `+OK` (Atomic swap under storage lock) |
-| `METRICS` | JSON object of cache stats |
+| Command | RESP / line form | Response |
+| :--- | :--- | :--- |
+| `SET key value [ttl]` | `SET key value [EX secs\|PX ms]` | `+OK` |
+| `GET key` | `GET key` | `$<len>\r\n<value>` (hit) or `$-1` (miss) |
+| `DEL key` | `DEL key` | `:1` (removed) or `:0` (absent) |
+| `PING [msg]` | `PING [msg]` | `+PONG` (or bulk echo of `msg`) |
+| `SELECT db` | `SELECT db` | `+OK` (single-database, ignored) |
+| `SWITCH_POLICY lru\|lfu\|sieve` | `SWITCH_POLICY sieve` | `+OK` (Atomic swap under storage lock) |
+| `METRICS` | `METRICS` | bulk string of cache stats JSON |
 
 ```bash
-# Example usage via netcat
+# Legacy line protocol via netcat
 printf 'SET user:42 alice 60\r\nGET user:42\r\n' | nc 127.0.0.1 6379
+
+# RESP2 via redis-cli (same port)
+redis-cli -p 6379 SET user:42 alice
+redis-cli -p 6379 GET user:42
 ```
+
+### Redis-benchmark comparison
+
+Because the wire format is RESP2, PolyCache can be benchmarked head-to-head with
+Redis using the official `redis-benchmark` tool:
+
+```bash
+# Run the 4-scenario matrix (PolyCache vs Redis, strict memory limit):
+python3 tools/bench_redis.py --mem-limit-mb 64 --keyspace 1000000
+
+# Or a single ad-hoc run:
+redis-benchmark -h 127.0.0.1 -p 6379 -t set,get,ping -n 100000 -r 1000000
+```
+
+`tools/bench_redis.py` pins each PolyCache policy against the closest Redis
+`allkeys-*` policy (`lru`↔`allkeys-lru`, `sieve`/`lfu`↔`allkeys-lfu`), forces a
+keyspace far larger than the cache so eviction actually fires, and reports
+per-command throughput (req/s) plus live hit-rate for both sides.
+
+> Note: the benchmark runs PolyCache with `--no-aof`, which disables the
+> synchronous per-write fsync so throughput reflects protocol/CPU cost. With
+> AOF on (the default, durability-by-design), `SET` throughput is intentionally
+> fsync-bound. `redis-benchmark` v8 has no standalone `DEL` test, so the matrix
+> covers `set`, `get`, `ping`.
 
 ### Admin HTTP API
 
@@ -80,7 +116,8 @@ SIEVE and LFU tie and consistently outperform LRU in scan-heavy phases.
 
 ## Project Structure
 
-* `/src`: C++17 server core (network I/O, storage engine, eviction policies, AOF persistence).
-* `/tests`: Plain C++17 unit tests for protocol parsing, storage mechanics, and SIEVE semantics.
+* `/src`: C++17 server core (network I/O, storage engine, eviction policies, AOF persistence, RESP parser).
+* `/tests`: Plain C++17 unit tests for protocol parsing, RESP framing, storage mechanics, and SIEVE semantics.
 * `benchmark.py`: Python 3 statistical benchmarking harness with multi-seed aggregation.
+* `tools/bench_redis.py`: RESP head-to-head harness driving `redis-benchmark` against PolyCache and Redis.
 * `Makefile`: Build system for the server and test binaries.

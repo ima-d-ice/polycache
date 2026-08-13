@@ -198,7 +198,15 @@ void Server::handle_readable(int fd) {
             continue;
         }
         if (n == 0) {
-            close_client(fd);
+            // Peer closed (or half-closed) the connection: process any
+            // complete frames still buffered before tearing it down, so a
+            // client that sends a command and then closes is still served.
+            process_frames(fd);
+            // process_frames may have already closed the client (e.g. on a
+            // send error during response), so only close if still alive.
+            if (buffers_.find(fd) != buffers_.end()) {
+                close_client(fd);
+            }
             return;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -210,29 +218,31 @@ void Server::handle_readable(int fd) {
         close_client(fd);
         return;
     }
-    process_lines(fd);
+    process_frames(fd);
 }
 
-void Server::process_lines(int fd) {
+void Server::process_frames(int fd) {
     for (;;) {
         auto it = buffers_.find(fd);
         if (it == buffers_.end()) {
             return;
         }
         string& buffer = it->second;
-        const size_t pos = buffer.find('\n');
-        if (pos == string::npos) {
-            return;
+        size_t consumed = 0;
+        const auto cmd = protocol::try_parse(buffer, consumed);
+        if (!cmd) {
+            return;  // incomplete frame; wait for more bytes
         }
-        string line = buffer.substr(0, pos);
-        buffer.erase(0, pos + 1);
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (line.empty()) {
+        buffer.erase(0, consumed);
+        if (cmd->type == protocol::Command::UNKNOWN && cmd->args.empty()) {
+            // Blank line / keepalive with no verb: ignore, as the legacy
+            // line protocol did, rather than replying with an error.
+            if (buffer.empty()) {
+                return;
+            }
             continue;
         }
-        queue_response(fd, execute_command(line));
+        queue_response(fd, execute_command(*cmd));
         if (buffers_.find(fd) == buffers_.end()) {
             return;
         }
@@ -297,19 +307,53 @@ void Server::close_client(int fd) {
     watch_flags_.erase(fd);
 }
 
-string Server::execute_command(const string& line) {
-    const protocol::Command cmd = protocol::parse_command(line);
+string Server::execute_command(const protocol::Command& cmd) {
     switch (cmd.type) {
+        case protocol::Command::PING: {
+            if (cmd.args.empty()) {
+                return "+PONG";
+            }
+            return "$" + to_string(cmd.args[0].size()) + "\r\n" + cmd.args[0];
+        }
+        case protocol::Command::SELECT:
+            // PolyCache is single-database; SELECT is accepted and ignored.
+            return "+OK";
         case protocol::Command::SET: {
             if (cmd.args.size() < 2) {
                 return "-ERR wrong number of arguments for SET";
             }
             int ttl = 0;
-            if (cmd.args.size() >= 3) {
+            bool saw_ex_px = false;
+            // Parse optional RESP-style modifiers (EX/PX). Any other trailing
+            // token (NX/XX/GET/KEEPTTL) is accepted but ignored for now.
+            for (size_t k = 2; k < cmd.args.size(); ++k) {
+                string opt = cmd.args[k];
+                transform(opt.begin(), opt.end(), opt.begin(),
+                          [](unsigned char c) {
+                              return static_cast<char>(toupper(c));
+                          });
+                if (opt == "EX" || opt == "PX") {
+                    saw_ex_px = true;
+                    if (k + 1 >= cmd.args.size()) {
+                        return "-ERR syntax error";
+                    }
+                    try {
+                        const int v = stoi(cmd.args[k + 1]);
+                        ttl = (opt == "PX") ? v / 1000 : v;
+                    } catch (...) {
+                        return "-ERR invalid expire value";
+                    }
+                    ++k;
+                }
+            }
+            // Legacy positional TTL fallback: if no EX/PX was seen and the
+            // third argument is numeric, treat it as seconds (backward compat
+            // with the line protocol "SET key value ttl").
+            if (!saw_ex_px && cmd.args.size() >= 3) {
                 try {
                     ttl = stoi(cmd.args[2]);
                 } catch (...) {
-                    return "-ERR invalid ttl";
+                    // non-numeric -> ignore, ttl stays 0
                 }
             }
             storage_->set(cmd.args[0], cmd.args[1], ttl);
@@ -338,8 +382,10 @@ string Server::execute_command(const string& line) {
             }
             return removed ? ":1" : ":0";
         }
-        case protocol::Command::METRICS:
-            return storage_->metrics().dump();
+        case protocol::Command::METRICS: {
+            const string json = storage_->metrics().dump();
+            return "$" + to_string(json.size()) + "\r\n" + json;
+        }
         case protocol::Command::SWITCH_POLICY: {
             if (cmd.args.empty()) {
                 return "-ERR wrong number of arguments for SWITCH_POLICY";
