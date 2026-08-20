@@ -35,17 +35,14 @@ make test
 
 ## Protocol & API Reference
 
-PolyCache speaks **two protocols on the same TCP port** (default `6379`, the
-Redis port). Request detection is per-frame: a frame beginning with `*` is
-parsed as **RESP2** (Redis Serialization Protocol — arrays of binary-safe bulk
-strings, pipelines supported); anything else falls back to the legacy
-line protocol (`VERB arg arg\r\n`). Both produce identical RESP-shaped
-responses, so the server is a drop-in target for `redis-benchmark` and
-`redis-cli`.
+PolyCache speaks **RESP2, the Redis wire protocol** (default port `6379`).
+Commands are `*<count>\r\n` arrays of `$<len>\r\n<data>\r\n` bulk strings —
+length-prefixed and binary-safe, with pipelining supported. The server is a
+drop-in target for `redis-benchmark` and `redis-cli`.
 
 ### TCP Commands
 
-| Command | RESP / line form | Response |
+| Command | RESP2 form | Response |
 | :--- | :--- | :--- |
 | `SET key value [ttl]` | `SET key value [EX secs\|PX ms]` | `+OK` |
 | `GET key` | `GET key` | `$<len>\r\n<value>` (hit) or `$-1` (miss) |
@@ -56,12 +53,12 @@ responses, so the server is a drop-in target for `redis-benchmark` and
 | `METRICS` | `METRICS` | bulk string of cache stats JSON |
 
 ```bash
-# Legacy line protocol via netcat
-printf 'SET user:42 alice 60\r\nGET user:42\r\n' | nc 127.0.0.1 6379
-
-# RESP2 via redis-cli (same port)
+# RESP2 via redis-cli (the protocol is Redis's own)
 redis-cli -p 6379 SET user:42 alice
 redis-cli -p 6379 GET user:42
+
+# Or raw RESP2 frames over netcat (binary-safe, length-prefixed):
+printf '*3\r\n$3\r\nSET\r\n$7\r\nuser:42\r\n$5\r\nalice\r\n' | nc 127.0.0.1 6379
 ```
 
 ### Redis-benchmark comparison
@@ -73,9 +70,14 @@ Redis using the official `redis-benchmark` tool:
 # Run the 4-scenario matrix (PolyCache vs Redis, strict memory limit):
 python3 tools/bench_redis.py --mem-limit-mb 64 --keyspace 1000000
 
-# Or a single ad-hoc run:
-redis-benchmark -h 127.0.0.1 -p 6379 -t set,get,ping -n 100000 -r 1000000
+# Or a single ad-hoc run (RESP-based tests only):
+redis-benchmark -h 127.0.0.1 -p 6379 -t set,get,ping_mbulk -n 100000 -r 1000000
 ```
+
+> Note: PolyCache speaks RESP2 only, so `redis-benchmark`'s `PING_INLINE`
+> test — which sends a raw `PING\r\n` line, not RESP — is unsupported (use
+> `ping_mbulk`, the RESP form). Every real client speaks RESP, so `redis-cli`
+> and libraries work untouched.
 
 `tools/bench_redis.py` pins each PolyCache policy against the closest Redis
 `allkeys-*` policy (`lru`↔`allkeys-lru`, `sieve`/`lfu`↔`allkeys-lfu`), forces a

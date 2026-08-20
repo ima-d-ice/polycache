@@ -37,7 +37,7 @@ SCENARIOS = [
     ("sieve", "allkeys-lru"),
 ]
 
-COMMANDS = ["set", "get", "ping"]
+COMMANDS = ["set", "get", "ping_mbulk"]  # RESP only; PING_INLINE is inline text
 
 
 def find_binary(name: str) -> str:
@@ -73,9 +73,15 @@ def polycache_ready(admin_port: int, timeout: float = 10.0) -> bool:
     return False
 
 
-def send_line(port: int, cmd: str, timeout: float = 2.0) -> str:
+def resp_command(port: int, *parts: str, timeout: float = 2.0) -> str:
+    """One RESP2 round trip: encode a *<n>\r\n array of bulk strings, read the
+    reply line, and return it (e.g. "+OK", "-ERR ...")."""
+    frame = b"*%d\r\n" % len(parts)
+    for p in parts:
+        raw = p.encode()
+        frame += b"$%d\r\n" % len(raw) + raw + b"\r\n"
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
-        s.sendall((cmd + "\r\n").encode())
+        s.sendall(frame)
         s.settimeout(timeout)
         return s.recv(256).decode(errors="replace").strip()
 
@@ -104,7 +110,7 @@ def start_polycache(port: int, admin_port: int, mem_mb: int, policy: str,
     if not polycache_ready(admin_port):
         sys.exit("polycache failed to come up on port %d" % port)
     if policy != "lru":  # lru is the default; explicit switch for the rest
-        reply = send_line(port, "SWITCH_POLICY " + policy)
+        reply = resp_command(port, "SWITCH_POLICY", policy)
         if reply != "+OK":
             print("  warning: SWITCH_POLICY %s -> %s" % (policy, reply))
     return proc
@@ -158,11 +164,12 @@ def run_scenario(policy: str, redis_policy: str, args) -> dict:
     procs = []
     results = {"policy": policy, "redis_policy": redis_policy}
     try:
-        # --no-aof disables PolyCache's synchronous per-write fsync so the
-        # benchmark measures protocol/CPU throughput; with AOF on, writes are
-        # intentionally fsync-bound (durability-by-design) and far slower.
+        # Default: --no-aof disables PolyCache's synchronous per-write fsync
+        # so the benchmark measures protocol/CPU throughput. With --with-aof
+        # on, writes are intentionally fsync-bound (durability-by-design) and
+        # far slower -- that is the honest tradeoff to show.
         procs.append(start_polycache(pc_port, pc_admin, args.mem_limit_mb,
-                                     policy, aof, no_aof=True))
+                                     policy, aof, no_aof=not args.with_aof))
         procs.append(start_redis(r_port, args.mem_limit_mb, redis_policy))
 
         pc_rps, r_rps = {}, {}
@@ -196,15 +203,19 @@ def print_results(rows: list, args) -> None:
     for row in rows:
         pc, rc = row["pc_rps"], row["r_rps"]
         print("%-10s | %-12s | %9.0f | %9.0f | %9.0f | %6.1f%%"
-              % ("PolyCache", row["policy"], pc["set"], pc["get"], pc["ping"],
+              % ("PolyCache", row["policy"], pc["set"], pc["get"], pc["ping_mbulk"],
                  row["pc_hit"] * 100))
         print("%-10s | %-12s | %9.0f | %9.0f | %9.0f | %6.1f%%"
-              % ("Redis", row["redis_policy"], rc["set"], rc["get"], rc["ping"],
+              % ("Redis", row["redis_policy"], rc["set"], rc["get"], rc["ping_mbulk"],
                  row["r_hit"] * 100))
         print("-" * len(header))
     print("Strict %dMB limit, keyspace -r %d >> capacity => eviction fires. "
-          "PolyCache --no-aof (no per-write fsync) for fair throughput."
           % (args.mem_limit_mb, args.keyspace))
+    if args.with_aof:
+        print("PolyCache AOF ON: every SET/DEL is synchronously fsynced "
+              "(durability-by-design) -- write throughput is disk-bound.")
+    else:
+        print("PolyCache --no-aof (no per-write fsync) for fair throughput.")
 
 
 def main() -> int:
@@ -222,6 +233,9 @@ def main() -> int:
                          "keeps capacity small enough to observe eviction)")
     ap.add_argument("--base-port", type=int, default=7100,
                     help="starting port; allocates +0/+1 PolyCache, +2 Redis")
+    ap.add_argument("--with-aof", action="store_true",
+                    help="keep PolyCache AOF ON (synchronous per-write "
+                         "fsync); default is --no-aof for fair throughput")
     args = ap.parse_args()
 
     rows = []

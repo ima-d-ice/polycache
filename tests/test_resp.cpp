@@ -93,19 +93,6 @@ int main() {
         CHECK(consumed == 123);
     }
 
-    // Inline command (no '*') falls back to the line protocol.
-    {
-        const std::string f = "SET foo bar 60\r\n";
-        size_t consumed = 0;
-        auto c = parse(f, consumed);
-        CHECK(consumed == f.size());
-        CHECK(c.type == Command::SET);
-        CHECK(c.args.size() == 3);
-        CHECK(c.args[0] == "foo");
-        CHECK(c.args[1] == "bar");
-        CHECK(c.args[2] == "60");
-    }
-
     // Pipelined RESP: two frames in one buffer parse sequentially.
     {
         const std::string a = "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
@@ -120,6 +107,6 @@ int main() {
         CHECK(c2.type == Command::PING);
     }
 
-    std::printf("ok resp (7 groups)\n");
+    std::printf("ok resp (6 groups)\n");
     return 0;
 }

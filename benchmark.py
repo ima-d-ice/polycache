@@ -202,11 +202,21 @@ def phase_of(i: int, n: int) -> int:
 
 
 # --------------------------------------------------------------------------
-# Minimal line-based TCP client (server responses are \r\n-terminated;
-# a GET hit is  $<len>\r\n<value>\r\n , a miss is  $-1)
+# Minimal RESP2 TCP client (the Redis wire protocol). Commands are encoded as
+# *<count>\r\n arrays of $<len>\r\n<data>\r\n bulk strings. Replies:
+#   +OK\r\n (simple string), -ERR ...\r\n (error), :<int>\r\n (integer),
+#   $<len>\r\n<data>\r\n (bulk string), $-1\r\n (null = GET miss).
 # --------------------------------------------------------------------------
 
-class LineSocket:
+def encode_resp(*parts: str) -> bytes:
+    out = b"*%d\r\n" % len(parts)
+    for p in parts:
+        raw = p.encode()
+        out += b"$%d\r\n" % len(raw) + raw + b"\r\n"
+    return out
+
+
+class RespSocket:
     def __init__(self, sock):
         self.sock = sock
         self.buf = b""
@@ -232,31 +242,36 @@ class LineSocket:
         data, self.buf = self.buf[:n], self.buf[n:]
         return data
 
-    def command(self, raw: bytes) -> bytes:
-        self.sock.sendall(raw + b"\r\n")
-        return self.read_until()
+    def command(self, *parts: str) -> bytes:
+        """One RESP2 round trip. Bulk-string replies return the payload bytes
+        (b"$-1" for a null/miss); simple/error/integer replies return the
+        full line including its prefix (b"+OK", b"-ERR ...")."""
+        self.sock.sendall(encode_resp(*parts))
+        head = self.read_until()
+        if not head:
+            raise ConnectionError("empty reply from server")
+        if head.startswith(b"$"):
+            if head == b"$-1":
+                return b"$-1"
+            payload = self.read_exact(int(head[1:]))
+            self.read_exact(2)  # trailing \r\n
+            return payload
+        return head  # +, -, : replies are a single line each
 
 
-def set_value(ls: LineSocket, key: str, value: str) -> None:
-    reply = ls.command(b"SET " + key.encode() + b" " + value.encode())
+def set_value(ls: RespSocket, key: str, value: str) -> None:
+    reply = ls.command("SET", key, value)
     if reply != b"+OK":
         raise RuntimeError("SET %s -> %r" % (key, reply))
 
 
-def get_value(ls: LineSocket, key: str) -> bool:
+def get_value(ls: RespSocket, key: str) -> bool:
     """One GET round trip; returns True on hit, False on miss."""
-    reply = ls.command(b"GET " + key.encode())
-    if reply == b"$-1":
-        return False
-    if not reply.startswith(b"$"):
-        raise RuntimeError("unexpected GET reply: %r" % reply)
-    length = int(reply[1:])
-    ls.read_exact(length + 2)  # value plus the trailing \r\n
-    return True
+    return ls.command("GET", key) != b"$-1"
 
 
-def switch_policy(ls: LineSocket, policy: str) -> bool:
-    return ls.command(b"SWITCH_POLICY " + policy.encode()) == b"+OK"
+def switch_policy(ls: RespSocket, policy: str) -> bool:
+    return ls.command("SWITCH_POLICY", policy) == b"+OK"
 
 
 # --------------------------------------------------------------------------
@@ -352,7 +367,7 @@ def run_mode(name, workload, preload_keys, cfg):
     with socket.create_connection((cfg.cache_host, cfg.cache_port),
                                   timeout=5) as sock:
         sock.settimeout(10)
-        ls = LineSocket(sock)
+        ls = RespSocket(sock)
 
         pinned = STATIC_POLICY.get(name)
         if pinned is not None:

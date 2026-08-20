@@ -1,6 +1,8 @@
 #include "protocol.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,74 +17,141 @@
 
 using protocol::Command;
 
+static Command parse(const std::string& buf, size_t& consumed) {
+    auto c = protocol::try_parse(buf, consumed);
+    if (!c) {
+        std::fprintf(stderr, "FAIL %s:%d: try_parse returned nullopt\n",
+                     __FILE__, __LINE__);
+        std::exit(1);
+    }
+    return *c;
+}
+
 int main() {
-    // SET with trailing whitespace + CRLF.
+    // RESP SET array (binary-safe bulk strings).
     {
-        auto c = protocol::parse_command("SET foo bar 60\r\n");
+        const std::string f = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        size_t consumed = 0;
+        auto c = parse(f, consumed);
+        CHECK(consumed == f.size());
         CHECK(c.type == Command::SET);
-        CHECK(c.args.size() == 3);
+        CHECK(c.args.size() == 2);
         CHECK(c.args[0] == "foo");
         CHECK(c.args[1] == "bar");
-        CHECK(c.args[2] == "60");
     }
 
     // Verb is case-insensitive; args preserved verbatim.
     {
-        auto c = protocol::parse_command("sEt Foo BAr");
+        const std::string f = "*3\r\n$3\r\nsEt\r\n$3\r\nFoo\r\n$3\r\nBAr\r\n";
+        size_t consumed = 0;
+        auto c = parse(f, consumed);
         CHECK(c.type == Command::SET);
         CHECK(c.args.size() == 2);
         CHECK(c.args[0] == "Foo");
         CHECK(c.args[1] == "BAr");
     }
 
-    // Leading whitespace + tabs split.
+    // RESP GET.
     {
-        auto c = protocol::parse_command("  \tGET\tfoo\r\n");
+        const std::string f = "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
+        size_t consumed = 0;
+        auto c = parse(f, consumed);
+        CHECK(consumed == f.size());
         CHECK(c.type == Command::GET);
         CHECK(c.args.size() == 1);
         CHECK(c.args[0] == "foo");
     }
 
-    // DEL keeps all tokens.
+    // RESP PING (used by redis-benchmark).
     {
-        auto c = protocol::parse_command("DEL alpha");
-        CHECK(c.type == Command::DEL);
-        CHECK(c.args.size() == 1);
-        CHECK(c.args[0] == "alpha");
-    }
-
-    // METRICS has no args.
-    {
-        auto c = protocol::parse_command("METRICS");
-        CHECK(c.type == Command::METRICS);
+        const std::string f = "*1\r\n$4\r\nPING\r\n";
+        size_t consumed = 0;
+        auto c = parse(f, consumed);
+        CHECK(c.type == Command::PING);
         CHECK(c.args.empty());
     }
 
-    // SWITCH_POLICY keeps the policy token.
+    // RESP SELECT (ignored by server, must parse).
     {
-        auto c = protocol::parse_command("SWITCH_POLICY sieve");
-        CHECK(c.type == Command::SWITCH_POLICY);
-        CHECK(c.args.size() == 1);
-        CHECK(c.args[0] == "sieve");
+        const std::string f = "*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n";
+        size_t consumed = 0;
+        auto c = parse(f, consumed);
+        CHECK(c.type == Command::SELECT);
+        CHECK(c.args.size() == 1 && c.args[0] == "0");
     }
 
-    // Empty and whitespace-only lines parse to UNKNOWN with no args.
+    // Binary-safe: key/value may contain spaces and newlines.
     {
-        auto c1 = protocol::parse_command("");
-        CHECK(c1.type == Command::UNKNOWN);
-        CHECK(c1.args.empty());
-        auto c2 = protocol::parse_command("   \t\r\n");
-        CHECK(c2.type == Command::UNKNOWN);
-        CHECK(c2.args.empty());
+        const std::string key = "k y";
+        const std::string val = "a\nb";
+        std::string f = "*3\r\n$3\r\nSET\r\n$3\r\n";
+        f += key + "\r\n$" + std::to_string(val.size()) + "\r\n" + val + "\r\n";
+        size_t consumed = 0;
+        auto c = parse(f, consumed);
+        CHECK(c.type == Command::SET);
+        CHECK(c.args.size() == 2);
+        CHECK(c.args[0] == key);
+        CHECK(c.args[1] == val);
+    }
+
+    // Incomplete RESP frame returns nullopt; consumed untouched.
+    {
+        const std::string f = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n";  // missing value
+        size_t consumed = 123;
+        auto c = protocol::try_parse(f, consumed);
+        CHECK(!static_cast<bool>(c));
+        CHECK(consumed == 123);
+    }
+
+    // DoS guard: absurd argument count is rejected before any allocation.
+    {
+        const std::string f = "*9999999\r\n";
+        size_t consumed = 0;
+        auto c = protocol::try_parse(f, consumed);
+        CHECK(!static_cast<bool>(c));
+    }
+
+    // Empty array (*0) parses to UNKNOWN with no args; consumed advances.
+    {
+        const std::string f = "*0\r\n";
+        size_t consumed = 0;
+        auto c = parse(f, consumed);
+        CHECK(c.type == Command::UNKNOWN);
+        CHECK(c.args.empty());
+        CHECK(consumed == f.size());
+    }
+
+    // DoS guard: declared bulk length larger than the whole buffer.
+    {
+        const std::string f = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$99999999\r\n";
+        size_t consumed = 0;
+        auto c = protocol::try_parse(f, consumed);
+        CHECK(!static_cast<bool>(c));
     }
 
     // Unknown verb -> UNKNOWN, args still captured.
     {
-        auto c = protocol::parse_command("BANANA x y");
+        const std::string f = "*3\r\n$6\r\nBANANA\r\n$1\r\nx\r\n$1\r\ny\r\n";
+        size_t consumed = 0;
+        auto c = parse(f, consumed);
         CHECK(c.type == Command::UNKNOWN);
         CHECK(c.args.size() == 2);
     }
 
-    std::printf("ok protocol (9 groups)\n");
+    // Pipelined RESP: two frames in one buffer parse sequentially.
+    {
+        const std::string a = "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
+        const std::string b = "*1\r\n$4\r\nPING\r\n";
+        const std::string buf = a + b;
+        size_t consumed = 0;
+        auto c1 = parse(buf, consumed);
+        CHECK(consumed == a.size());
+        CHECK(c1.type == Command::GET);
+        auto c2 = parse(buf.substr(consumed), consumed);
+        CHECK(consumed == b.size());
+        CHECK(c2.type == Command::PING);
+    }
+
+    std::printf("ok protocol (12 groups)\n");
     return 0;
 }

@@ -9,38 +9,6 @@ namespace protocol {
 
 namespace {
 
-string trim(const string& s) {
-    const auto first = find_if_not(s.begin(), s.end(), [](unsigned char c) {
-        return isspace(c) != 0;
-    });
-    if (first == s.end()) {
-        return {};
-    }
-    const auto last = find_if_not(s.rbegin(), s.rend(), [](unsigned char c) {
-        return isspace(c) != 0;
-    }).base();
-    return string(first, last);
-}
-
-vector<string> split(const string& s) {
-    vector<string> tokens;
-    string current;
-    for (char c : s) {
-        if (isspace(static_cast<unsigned char>(c))) {
-            if (!current.empty()) {
-                tokens.push_back(std::move(current));
-                current.clear();
-            }
-        } else {
-            current.push_back(c);
-        }
-    }
-    if (!current.empty()) {
-        tokens.push_back(std::move(current));
-    }
-    return tokens;
-}
-
 Command classify(const string& verb, vector<string> args) {
     Command cmd;
     string v = verb;
@@ -68,21 +36,18 @@ Command classify(const string& verb, vector<string> args) {
     return cmd;
 }
 
-// Parse a RESP2 array of bulk strings: *<n>\r\n then n x ($<len>\r\n<data>\r\n).
-// Returns nullopt if the frame is incomplete, else a Command built from the
-// array elements (first element = verb, rest = args).
-// Safety: caps argument count and bulk length to prevent DoS via giant
-// allocations or size_t overflow.
-optional<Command> parse_resp(const string& buf, size_t& consumed) {
-    static constexpr long kMaxArgs = 1024;
+}  // namespace
+
+optional<Command> try_parse(const string& buf, size_t& consumed) {
+    static constexpr long kMaxArgs = 1024;  // DoS cap on argument count
     size_t i = 0;
-    if (i >= buf.size() || buf[i] != '*') {
+    if (buf.empty() || buf[i] != '*') {
         return nullopt;
     }
     ++i;
     const size_t nl = buf.find('\n', i);
     if (nl == string::npos) {
-        return nullopt;
+        return nullopt;  // not a complete array header yet
     }
     size_t num_end = nl;
     if (num_end > i && buf[num_end - 1] == '\r') {
@@ -100,7 +65,7 @@ optional<Command> parse_resp(const string& buf, size_t& consumed) {
         return classify("", {});
     }
     if (count > kMaxArgs) {
-        return nullopt;
+        return nullopt;  // DoS guard: absurd argument count
     }
 
     vector<string> args;
@@ -112,7 +77,7 @@ optional<Command> parse_resp(const string& buf, size_t& consumed) {
         ++i;
         const size_t lend = buf.find('\n', i);
         if (lend == string::npos) {
-            return nullopt;
+            return nullopt;  // not a complete length line yet
         }
         size_t e = lend;
         if (e > i && buf[e - 1] == '\r') {
@@ -126,16 +91,16 @@ optional<Command> parse_resp(const string& buf, size_t& consumed) {
         }
         i = lend + 1;
         if (len < 0) {
-            return nullopt;
+            return nullopt;  // $-1 (null) is not a valid command argument
         }
         const size_t need = static_cast<size_t>(len);
         if (need > buf.size()) {
-            return nullopt;
+            return nullopt;  // DoS guard: declared length exceeds the buffer
         }
         if (i + need + 2 > buf.size()) {
-            return nullopt;
+            return nullopt;  // payload (or its CRLF) not fully buffered yet
         }
-        args.push_back(buf.substr(i, need));
+        args.push_back(buf.substr(i, need));  // verbatim copy = binary-safe
         i += need;
         if (buf[i] == '\r') {
             ++i;
@@ -153,41 +118,6 @@ optional<Command> parse_resp(const string& buf, size_t& consumed) {
     }
     string verb = args[0];
     vector<string> rest(args.begin() + 1, args.end());
-    return classify(verb, std::move(rest));
-}
-
-}  // namespace
-
-optional<Command> try_parse(const string& buf, size_t& consumed) {
-    if (buf.empty()) {
-        return nullopt;
-    }
-    if (buf[0] == '*') {
-        return parse_resp(buf, consumed);
-    }
-    const size_t nl = buf.find('\n');
-    if (nl == string::npos) {
-        return nullopt;
-    }
-    string line = buf.substr(0, nl);
-    if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-    }
-    consumed = nl + 1;
-    return parse_command(line);
-}
-
-Command parse_command(const string& line) {
-    const string trimmed = trim(line);
-    if (trimmed.empty()) {
-        return classify("", {});
-    }
-    vector<string> tokens = split(trimmed);
-    if (tokens.empty()) {
-        return classify("", {});
-    }
-    const string verb = tokens[0];
-    vector<string> rest(tokens.begin() + 1, tokens.end());
     return classify(verb, std::move(rest));
 }
 
