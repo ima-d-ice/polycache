@@ -17,9 +17,6 @@ jobs:
       - name: Unit tests (22 groups)
         run: make test
 
-      - name: Python compile check
-        run: python3 -m py_compile benchmark.py tools/bench_redis.py
-
       - name: Sanitizers (ASan + UBSan, blocking)
         run: make sanitize
 

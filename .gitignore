@@ -18,6 +18,9 @@ compare_results.json
 kybernetes
 INTERVIEW_PREP.md
 CPP_SNIPPETS.md
+SYSCALLS.md
+benchmark.py
+tools/bench_redis.py
 compile_commands.json
 .cache/
 *.dSYM/

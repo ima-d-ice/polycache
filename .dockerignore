@@ -13,5 +13,3 @@ __pycache__/
 .github/
 .DS_Store
 *.png
-benchmark.py
-tools/
