@@ -14,20 +14,22 @@
 
 ## Demo
 
-> [TODO: demo GIF — record a 30–60s terminal session and embed it here as `demo.gif`: build + start the server, `SET`/`GET` a key via `redis-cli`, hit `/metrics`, then `SWITCH_POLICY` from `lru` to `sieve` mid-run. I suggest [VHS](https://github.com/charmbracelet/vhs) or `asciinema` + `agg` so it renders inline on GitHub.]
-
-Sample session (real output shape):
+Real session, captured from the running server:
 
 ```bash
-$ ./polycache &
+$ ./polycache
 PolyCache listening on port 6379, admin on port 8080, policies: lru, lfu, sieve
 
 $ redis-cli -p 6379 SET user:42 alice
 OK
 $ redis-cli -p 6379 GET user:42
-"alice"
+alice
+$ redis-cli -p 6379 SWITCH_POLICY sieve
+OK
 $ curl -s http://127.0.0.1:8080/metrics
-{"evictions":0,"hit_rate":1.0,"hits":1,"memory_bytes":13,"policy":"lru"}
+{"evictions":0,"hit_rate":1.0,"hits":1,"memory_bytes":12,"miss_rate":0.0,"misses":0,"policy":"sieve","total_keys":1}
+$ curl -s http://127.0.0.1:8080/health
+{"status":"ok"}
 ```
 
 ## Architecture
