@@ -10,7 +10,7 @@
 - **Measured +14pt hit-rate gap** — SIEVE/LFU score 0.30 vs LRU's 0.16 on a 90K-request adversarial workload (5 seeds, mean ± std reported).
 - **Redis-compatible wire protocol (RESP2)** — works with `redis-cli` and `redis-benchmark`; benchmarked head-to-head against real Redis.
 - **Crash-safe by default** — synchronous append-only log with replay on boot; durability chosen over raw write throughput.
-- **Strict CI gate** — unit tests, ASan+UBSan, `clang-tidy` as errors, and a reproducible Docker build all block on every push.
+- **Reproducible build** — one `Dockerfile` compiles the server from scratch; CI rebuilds it on every push.
 
 ## Demo
 
@@ -66,7 +66,7 @@ Phased workload (Zipf reads → scan + churn → mixed) with a 1MB cache and a w
 | **static_lfu** | **0.3041 ± 0.0502** | 0.2890 | 0.2293 | **0.3868** |
 | static_lru | 0.1630 ± 0.0508 | 0.2885 | 0.0846 | 0.1200 |
 
-Methodology: 90K requests, seeds `1 7 42 123 999`, `--cache-size-mb 1 --hot-size 11000`. Hardware: [TODO: CPU/RAM/OS, e.g. "M1 MacBook Air, 8GB, macOS 14"]. Throughput/latency: [TODO: req/s + p99 — measured locally against Redis via `redis-benchmark`, harness kept local-only].
+Methodology: 90K requests, seeds `1 7 42 123 999`, `--cache-size-mb 1 --hot-size 11000`.
 
 ## Design decisions
 
@@ -79,9 +79,8 @@ Methodology: 90K requests, seeds `1 7 42 123 999`, `--cache-size-mb 1 --hot-size
 ## Quick start
 
 ```bash
-# Build (g++, C++17) and run tests — verified working:
+# Build (g++, C++17) — verified working:
 make          # builds ./polycache
-make test     # 22 test groups, all must print "ok ..."
 
 # Run locally (defaults: TCP 6379, admin 8080, 64MB, AOF on):
 ./polycache
@@ -113,19 +112,8 @@ src/
   admin.{h,cpp}       HTTP /metrics + /health on worker-thread epoll loop
   main.cpp            CLI flags, signal handling, boot order
   epoll_compat.h      epoll→poll shim for macOS builds only
-tests/                test_sieve / test_protocol / test_storage (assert macros, no framework)
 Dockerfile / Makefile / .github/workflows/ci.yml
 ```
-
-## Testing
-
-```bash
-make test      # unit tests: 22 groups (sieve 6, protocol 12, storage 4)
-make sanitize  # rebuilds with ASan+UBSan and re-runs tests (blocking in CI)
-make tidy      # clang-tidy with warnings-as-errors (blocking in CI)
-```
-
-Coverage: SIEVE hand-pointer semantics, RESP2 framing (partial reads, binary-safe, DoS caps), storage set/get/del/TTL/policy-switch/memory-limit behavior.
 
 ## Limitations & future work
 
@@ -138,4 +126,4 @@ Coverage: SIEVE hand-pointer semantics, RESP2 framing (partial reads, binary-saf
 
 C++17 · Linux `epoll` · `nlohmann/json` (sole vendored dep) · Docker · GitHub Actions.
 
-[TODO: your links — e.g. GitHub: https://github.com/ima-d-ice · LinkedIn: [TODO] · Email: [TODO]]
+GitHub: https://github.com/ima-d-ice

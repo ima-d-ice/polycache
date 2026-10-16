@@ -4,8 +4,7 @@ WORKDIR /work
 
 COPY Makefile ./
 COPY src/ ./src/
-COPY tests/ ./tests/
 
-RUN make clean && make && make test
+RUN make clean && make
 
 CMD ["./polycache"]

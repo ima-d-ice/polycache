@@ -1,9 +1,6 @@
 *.o
 *.d
 polycache
-test_sieve
-test_protocol
-test_storage
 *.aof
 *.log
 venv/

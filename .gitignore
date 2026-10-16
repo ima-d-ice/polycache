@@ -3,9 +3,6 @@
 *.aof
 *.log
 polycache
-test_sieve
-test_protocol
-test_storage
 .DS_Store
 __pycache__/
 *.pyc
