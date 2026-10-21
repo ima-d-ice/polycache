@@ -29,7 +29,7 @@ void handle_signal(int /*sig*/) {
 void print_usage(const char* prog) {
     cerr << "usage: " << prog
          << " [--port PORT] [--admin-port PORT] [--memory-limit MB] "
-             "[--aof-file FILE] [--no-aof]\n";
+            "[--max-value-size MB] [--aof-file FILE] [--no-aof]\n";
 }
 
 }  // namespace
@@ -37,7 +37,8 @@ void print_usage(const char* prog) {
 int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermost frame; std::exceptions are caught below, anything else terminating here is the defined behavior
     int port = 6379;
     int admin_port = 8080;
-    size_t memory_mb = 64;
+    size_t memory_mb = 1024;
+    size_t max_value_mb = 512;
     string aof_file = "polycache.aof";
     bool use_aof = true;
 
@@ -57,6 +58,8 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
                 admin_port = stoi(next_value(arg));
             } else if (arg == "--memory-limit") {
                 memory_mb = static_cast<size_t>(stoul(next_value(arg)));
+            } else if (arg == "--max-value-size") {
+                max_value_mb = static_cast<size_t>(stoul(next_value(arg)));
             } else if (arg == "--aof-file") {
                 aof_file = next_value(arg);
             } else if (arg == "--no-aof") {
@@ -75,31 +78,45 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
         }
     }
 
+    if (memory_mb == 0 || max_value_mb == 0) {
+        cerr << "--memory-limit and --max-value-size must be at least 1MB\n";
+        return 1;
+    }
+    if (max_value_mb > memory_mb) {
+        cerr << "warning: --max-value-size (" << max_value_mb
+             << "MB) exceeds --memory-limit (" << memory_mb
+             << "MB); values larger than the cache will be rejected\n";
+    }
+
+    const size_t max_value_bytes = max_value_mb * 1024 * 1024;
+
     // Startup can throw (TTL/admin thread creation, allocations): report
     // cleanly instead of escaping main with an uncaught exception.
     try {
-    Storage storage(memory_mb * 1024 * 1024);
-    std::unique_ptr<AOFLogger> aof;
-    if (use_aof) {
-        aof = std::make_unique<AOFLogger>(aof_file);
-        aof->replay(&storage);
-    }
+        Storage storage(memory_mb * 1024 * 1024, max_value_bytes);
+        std::unique_ptr<AOFLogger> aof;
+        if (use_aof) {
+            aof = std::make_unique<AOFLogger>(aof_file);
+            aof->replay(&storage);
+        }
 
-    Server server(port, &storage, aof.get());
-    AdminServer admin(admin_port, &storage);
+        Server server(port, &storage, aof.get(), max_value_bytes);
+        AdminServer admin(admin_port, &storage);
 
-    struct sigaction sa {};
-    sa.sa_handler = handle_signal;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
+        struct sigaction sa {};
+        sa.sa_handler = handle_signal;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
 
-    g_admin = &admin;
+        g_admin = &admin;
         thread admin_thread([&admin] { admin.start(); });
 
         g_server = &server;
         cout << "PolyCache listening on port " << port << ", admin on port "
-             << admin_port << ", policies: lru, lfu, sieve" << '\n';
+             << admin_port << ", memory " << memory_mb << "MB, max value "
+             << max_value_mb << "MB, policies: lru, lfu, sieve" << '\n'
+             << flush;
         server.start();
         g_server = nullptr;
 
