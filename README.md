@@ -1,87 +1,87 @@
 # PolyCache
 
-**A C++17 in-memory cache that speaks Redis RESP2 and stores opaque binary blobs up to 512MB — zero-copy GETs, enforced memory limits, honest persistence.**
+A C++17 in-memory cache that speaks Redis RESP2 and stores opaque binary values up to 512MiB. I built it to work through the systems details a cache server hides: incremental parsing, bounded memory, non-blocking partial sends, and a persistence log that does not pretend to be a database.
 
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)](https://en.wikipedia.org/wiki/C%2B%2B17)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Protocol: RESP2](https://img.shields.io/badge/protocol-RESP2-blue)](#features)
 
-![PolyCache demo](demo.gif)
 
-## What it is
-
-PolyCache is a single-node key/value cache. Values are opaque binary strings — a JSON row, a 100KB PNG, and a 512MB object all take the same path through the parser, storage, and GET response. The parser streams each bulk once into its final string; GET streams the stored `shared_ptr<const string>` without copying the payload.
 
 ## Highlights
 
-- **Binary-safe blobs to 512MB.** No 64KB frame buffer. A 512MB object round-trips byte-for-byte (SHA-256 verified).
-- **Zero-copy GETs.** Values live as `shared_ptr<const string>`; the outbox sends header + blob + trailer without copying the payload.
-- **Measured throughput.** 1KB rows: ~310K SET/s, ~245K GET/s. 1MB images: ~3.9K SET/s, ~4.6K GET/s. 512MB resident set: 524.5MB RSS.
-- **Operable.** `GET /metrics` and `GET /health` on a separate admin port; graceful shutdown on `SIGINT`/`SIGTERM`.
-- **Honest persistence.** AOF is JSON lines with base64 keys/values, flushed per write but **not fsynced**. Use `--no-aof` for large blobs.
+- **Binary-safe values up to 512MiB.** The parser writes each bulk directly into its final string; a 512MiB random blob round-tripped with matching SHA-256.
+- **No user-space copy on GET.** Values are `shared_ptr<const string>`; the outbox sends header, payload, and trailer from the stored allocation. An in-flight GET keeps an evicted blob alive.
+- **One client event loop, measured throughput.** 279K SET/s and 227K GET/s for 1KiB rows; 3.1K and 3.5K ops/s for 1MiB blobs on an Apple M1. Single client, loopback TCP. See the benchmark table below.
+- **Bounded memory with accounted eviction.** LRU eviction charges string capacity, key bytes, 128B per-entry overhead, and the hash bucket array against the configured limit.
+- **Operable.** `/metrics` and `/health` on a separate admin port, graceful shutdown on `SIGINT`/`SIGTERM`, AOF replay, and a Dockerfile.
 
 ## Demo
 
-A GIF of a real session: store a JSON row, store a JPEG with `redis-cli -x`, read both back byte-for-byte (`cmp` identical), then check `/metrics`.
-
-**[TODO: Record demo.gif]** — run `python3 tools/make_demo_gif.py` against a fresh `./polycache --no-aof` server. Requires Pillow and `redis-cli`.
+![PolyCache demo: store text, JSON, and a JPEG, then verify the binary round-trip](demo.gif)
 
 ## Architecture
 
-One single-threaded `epoll` loop owns all client I/O (parser → storage → segmented outbox). A second `epoll` loop on a worker thread serves admin HTTP (`/metrics`, `/health`). All cache state is behind one mutex-guarded `Storage`. The only other thread is the ~100ms TTL sweeper.
+One single-threaded `epoll` loop owns client I/O: read, incremental parse, execute, queue, partial send. A second `epoll` loop on a worker thread serves HTTP admin traffic (`/metrics`, `/health`). Cache state sits behind one mutex-guarded `Storage`; the TTL manager runs a ~100ms sweeper thread. On macOS, a `poll`-based shim stands in for `epoll`.
 
 ```mermaid
 flowchart LR
-    C[redis-cli / app] -- RESP2 TCP :6379 --> S[Server<br/>single-thread epoll]
-    S --> P[Incremental RESP parser<br/>one allocation per bulk]
-    P --> ST[(Storage<br/>hash map + shared blobs + stats)]
-    ST --> EV{LRU eviction}
-    ST --> TTL[TTLManager<br/>sweeper thread]
-    S --> O[Segmented outbox<br/>head + shared blob + tail]
-    S --> AOF[AOF<br/>JSON lines + base64<br/>flush per write, no fsync]
-    AOF -. replay on boot .-> ST
-    M[monitoring] -- HTTP :8080 --> AD[AdminServer<br/>worker-thread epoll]
+    C[redis-cli / client] -- RESP2 TCP :6379 --> S[Server<br/>single-thread epoll]
+    S --> P[Incremental RESP2 parser<br/>one allocation per bulk]
+    P --> ST[(Storage<br/>unordered_map + shared blobs)]
+    ST --> LRU[LRU eviction]
+    ST --> TTL[TTLManager<br/>~100ms sweeper]
+    S --> OB[Segmented outbox<br/>head + shared blob + tail]
+    OB -- partial send --> C
+    S --> AOF[AOFLogger<br/>JSON lines + base64]
+    AOF -. replay at boot .-> ST
+    M[curl / monitoring] -- HTTP :8080 --> AD[AdminServer<br/>worker-thread epoll]
     AD --> ST
 ```
 
-**Large-value flow:**
-1. Parser reads `$<len>`, allocates the argument string once. Payload bytes go straight from `recv()` into the string — no frame buffer, no second copy.
-2. `Storage::set` moves the string into a `shared_ptr<const string>` and charges the eviction policy for capacity plus per-entry metadata. Values that don't fit are rejected before the AOF is touched.
-3. `GET` copies the `shared_ptr`, not the bytes. Partial sends resume when the fd becomes writable; an eviction can't free bytes a response is still streaming.
+**SET path:** `recv` → parser allocates the bulk once → AOF appends a line → `Storage::set` moves the value into a `shared_ptr<const string>` and LRU accounts for it → `+OK`.
+
+**GET path:** `Storage::get` returns the shared blob → the outbox sends header, payload, and trailer without copying the payload → `EPOLLOUT` resumes a partial send.
+
+**Persistence:** every applied `SET`/`DEL` is appended and flushed, but not `fsync`ed. Replay walks the log at boot.
 
 ## Features
 
 **Protocol**
-- RESP2 only: `*<count>\r\n` arrays of `$<len>\r\n<data>\r\n` bulk strings, binary-safe and pipelined.
-- Verbs: `SET`, `GET`, `DEL`, `METRICS`, `PING`, `SELECT` (ignored, single database). Unknown verbs get an explicit error.
-- Argument count ≤ 1024; declared bulk length capped at `--max-value-size` + 1MB overshoot.
+- RESP2 only: binary-safe bulk strings, pipelined commands, explicit errors for unknown commands.
+- Commands: `SET`, `GET`, `DEL`, `METRICS`, `PING`, `SELECT` (accepted and ignored; one database).
+- Guards: ≤1,024 arguments, 1MiB key cap, and a declared bulk cap of `min(--max-value-size, memory limit) + 1MiB` so oversized values get a clean error.
 
-**Storage**
-- Default 1024MB memory limit, 512MB max value, 1MB max key.
-- Charged at `value.capacity() + 128B` overhead plus key; bucket array included in `used_memory`.
+**Storage and memory**
+- Opaque values from 0 bytes to `--max-value-size` (512MiB by default).
+- LRU eviction; memory accounting includes `value.capacity()`, key bytes, 128B per-entry overhead, and the bucket array.
+- Memory limit defaults to 1GiB and is enforced after each write.
 
-**Eviction**
-- LRU behind one interface. All policy calls under the storage lock.
+**I/O**
+- Non-blocking `epoll` on Linux; a `poll`-based shim keeps macOS builds working.
+- Per-client incremental parser, partial reads, partial writes, and a segmented outbox.
+- Outbox capped at 1,024 queued chunks per client.
 
-**TTL**
-- `SET … EX seconds` and `PX milliseconds`; background sweeper (~100ms) plus lazy expiry. Second granularity; `PX` rounds up.
+**TTL and persistence**
+- `SET key value EX seconds` and `PX milliseconds`; lazy expiry plus a background sweeper.
+- JSON-lines AOF with base64 keys and values; replay on boot; no rewrite or compaction.
 
-**AOF**
-- One JSON line per `SET`/`DEL`, base64-encoded keys/values. Flushed per write, not fsynced. No rewrite or compaction.
-
-**Admin HTTP**
-- `GET /metrics` — memory, hits/misses, evictions, expirations, largest item.
-- `GET /health` — `{"status":"ok"}`.
+**Operations**
+- `GET /metrics`: memory, keys, hits/misses, evictions, expirations, largest item.
+- `GET /health`: `{"status":"ok"}`.
+- CLI flags for ports, memory, max value, AOF file, and `--no-aof`.
+- Graceful shutdown on `SIGINT`/`SIGTERM`.
 
 ## Benchmarks / Results
 
-Apple M1, 8GB RAM, macOS 26.5, loopback TCP, one client, `--no-aof`, three fresh-server runs, medians. 1KB values are JSON-like 1,024-byte rows; 1MB values are random binary bytes. Keys use ~50% of the 1GB budget (20,000 at 1KB, 512 at 1MB). MB/s are decimal (1e6); memory is MiB.
+**Setup:** Apple M1, 8GB RAM, macOS 26.5, loopback TCP, one client, `--no-aof`, three fresh server processes per payload, medians. Measured 2026-10-23. 1KiB values are JSON-like rows; 1MiB values are random bytes. The 1KiB case uses 20,000 keys (the script's cap); the 1MiB case uses 512 keys (~50% of the 1GiB budget). Throughput is pipelined; p50/p99 are sequential round trips. No eviction occurs in these runs, so this measures the payload path and memory overhead, not policy quality. MB/s is decimal (10^6 bytes/s); memory is MiB.
 
-| Payload | Keys | SET ops/s | GET ops/s | SET p50/p99 | GET p50/p99 | used | RSS | hit rate |
-|:--------|------:|----------:|----------:|------------:|------------:|------:|----:|---------:|
-| 1KB row | 20,000 | 310,081 | 245,093 | 0.03 / 0.05 ms | 0.03 / 0.06 ms | 22.5MB | 33.2MB | 1.000 |
-| 1MB image | 512 | 3,895 | 4,566 | 0.24 / 0.29 ms | 0.29 / 0.46 ms | 512.1MB | 524.5MB | 1.000 |
+| Payload | Keys | SET ops/s (MB/s) | GET ops/s (MB/s) | SET p50/p99 | GET p50/p99 | used / RSS | hit rate |
+|:--|--:|--:|--:|--:|--:|--:|--:|
+| 1KiB row | 20,000 | 279,277 (286) | 226,598 (232) | 0.03 / 0.06 ms | 0.04 / 0.07 ms | 22.5 / 32.6 MiB | 1.000 |
+| 1MiB blob | 512 | 3,133 (3,285) | 3,504 (3,674) | 0.27 / 0.51 ms | 0.33 / 0.68 ms | 512.1 / 526.6 MiB | 1.000 |
 
-**512MB smoke test:** SET 0.36s / GET 0.27s, SHA-256 matched. Manual correctness check, not part of the table.
+**512MiB correctness smoke test:** a 512MiB random blob stored and read back through `redis-cli`; SHA-256 matched. End-to-end, including the client: 2.16s SET / 1.97s GET. This is a correctness check, not a throughput benchmark.
 
 Reproduce:
 
@@ -90,76 +90,92 @@ make
 python3 blob_bench.py --runs 3
 ```
 
-## Design decisions & trade-offs
+The script starts a fresh server per run, drives it over TCP, and reads `used_memory` from `/metrics` plus RSS from `ps`. Numbers vary with machine load and thermal state.
 
-1. **Streaming parser over a frame buffer.** A 512MB value is copied once into its final string, never into a 512MB intermediate buffer and then into a value.
-2. **Shared values over copies.** `GET` returns `shared_ptr<const string>`, so large reads are zero-copy and eviction stays safe mid-send.
-3. **Single-threaded `epoll` over a thread pool.** Cache ops are short map lookups; thread handoff costs more than it saves. Tradeoff: one slow 512MB operation blocks the loop.
-4. **RESP2 instead of a custom protocol.** `redis-cli` works without a bespoke client.
-5. **Explicit errors over silent option loss.** `NX`/`XX`/`GET`/`KEEPTTL` return `-ERR unsupported SET option` instead of being silently ignored.
+## Design decisions and trade-offs
+
+1. **Single-threaded `epoll` instead of a thread pool.** Cache operations are short hash-map lookups; a thread handoff costs more than it saves for small values. The trade-off is real: one 512MiB `SET`/`GET` blocks every other client on that loop.
+2. **Parse directly into the final string instead of a frame buffer.** A 512MiB value is allocated once from the declared bulk length and filled from `recv`. This avoids a second full-size copy, at the cost of a more stateful parser and holding the allocation until the command completes.
+3. **Shared blobs instead of copying values into responses.** `GET` returns a `shared_ptr<const string>`; the outbox sends from that allocation. Eviction cannot free bytes that a response is still streaming. The cost is a control block per value and keeping an evicted blob alive until the last send finishes.
+4. **RESP2 subset with explicit errors.** `redis-cli` works without a bespoke client, and the wire format is well specified. The cost is implementing a subset and rejecting what I do not support rather than silently ignoring options.
+5. **AOF with flush, not `fsync`.** The log is simple, binary-safe via base64, and inspectable with `jq` after decoding. It is not a durable database: a crash can lose the last writes, base64 inflates values by ~33%, and there is no compaction.
 
 ## Quick start
 
+Requires `g++` (or `clang++`) with C++17 and `make`. `redis-cli` and `curl` are only for the examples.
+
 ```bash
-# Build
+git clone https://github.com/ima-d-ice/polycache.git
+cd polycache
 make
-
-# Run tests
 make test
-
-# Start (defaults: port 6379, admin 8080, 1024MB memory, 512MB max value, AOF on)
 ./polycache
-
-# Disable AOF for large-blob throughput
-./polycache --no-aof
-
-# Custom limits
-./polycache --memory-limit 2048 --max-value-size 512
 ```
 
-Talk to it with any Redis client:
+Defaults: RESP2 on `:6379`, admin HTTP on `:8080`, 1GiB memory limit, 512MiB max value, AOF on (`polycache.aof`).
+
+In another terminal:
 
 ```bash
+redis-cli -p 6379 PING
 redis-cli -p 6379 SET greeting "hello polycache"
-redis-cli -p 6379 SET row:42 '{"id":42,"name":"alice","active":true}'
+redis-cli -p 6379 GET greeting
 
-# Binary blob in, out, verified byte-for-byte
+redis-cli -p 6379 SET row:42 '{"id":42,"name":"alice","active":true}'
+redis-cli -p 6379 GET row:42
+
+# Binary round-trip
 redis-cli -p 6379 -x SET image:demo < photo.jpg
-redis-cli -p 6379 --raw GET image:demo | head -c "$(wc -c < photo.jpg)" > out.jpg
+SIZE=$(wc -c < photo.jpg | tr -d ' ')
+redis-cli -p 6379 --raw GET image:demo | head -c "$SIZE" > out.jpg
 cmp -s photo.jpg out.jpg && echo identical
 
-# Observability
-curl -s http://127.0.0.1:8080/metrics
+# Admin HTTP
 curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:8080/metrics
 ```
 
-Graceful shutdown on `SIGINT`/`SIGTERM`. Requires `g++` with C++17 and `make` (`redis-cli`/`curl` only for examples).
+Run without AOF for throughput or large blobs:
+
+```bash
+./polycache --no-aof
+```
+
+Custom limits:
+
+```bash
+./polycache --memory-limit 2048 --max-value-size 512 --port 6380 --admin-port 8081
+```
+
+Docker (optional; the AOF is inside the container and is lost with `--rm`):
 
 ```bash
 docker build -t polycache .
 docker run --rm -p 6379:6379 -p 8080:8080 polycache
 ```
 
+Graceful shutdown: `Ctrl-C` or `SIGTERM`.
+
 ## Project structure
 
 ```
 src/
-  server.{h,cpp}      single-thread epoll loop, segmented outbox, RESP dispatch
-  storage.{h,cpp}     mutex-guarded map, shared blobs, limits, stats
-  protocol.{h,cpp}    incremental RESP2 parser (no frame buffer)
-  eviction/           policy.h + lru.cpp (LFU/SIEVE sources retained, unused)
-  aof.{h,cpp}         JSON-line AOF with base64 keys/values, flush-only, replay
+  main.cpp            CLI flags, boot order, SIGINT/SIGTERM handling
+  server.{h,cpp}      single-thread epoll loop, RESP dispatch, segmented outbox
+  protocol.{h,cpp}    incremental RESP2 parser; one allocation per bulk
+  storage.{h,cpp}     mutex-guarded map, shared blobs, limits, metrics
+  eviction/           policy interface + LRU (LFU/SIEVE sources present, not wired)
   ttl.{h,cpp}         background expiry sweeper
-  admin.{h,cpp}       HTTP /metrics + /health on worker-thread epoll
-  main.cpp            CLI flags, signal handling, boot order
-  epoll_compat.h      epoll→poll shim for macOS builds only
+  aof.{h,cpp}         JSON-line/base64 append and replay
+  admin.{h,cpp}       HTTP /metrics + /health on a worker thread
+  epoll_compat.h      epoll -> poll shim for macOS
+  third_party/        vendored nlohmann/json
 tests/
-  test_protocol.cpp   parser fragmentation, pipelining, binary payloads, bad headers
-  test_storage.cpp    binary round-trip, limits, eviction, empty keys, TTL, overwrite
-blob_bench.py         real 1KB/1MB payload benchmark + RSS/used_memory
-tools/make_demo_gif.py  generates demo.gif from a real session (Pillow)
-demo.gif
-Dockerfile / Makefile
+  test_protocol.cpp   parser fragmentation, pipelining, binary payloads, errors
+  test_storage.cpp    round-trip, limits, LRU eviction, TTL, overwrite accounting
+blob_bench.py         fresh-server throughput/latency/memory benchmark
+tools/make_demo_gif.py  regenerates demo.gif from a real session
+Makefile / Dockerfile / demo.gif
 ```
 
 ## Testing
@@ -168,21 +184,35 @@ Dockerfile / Makefile
 make test
 ```
 
-Runs `tests/test_protocol.cpp` (parser fragmentation, pipelining, 1MB binary payload, split trailers, bad headers, empty keys/values) and `tests/test_storage.cpp` (binary round-trip, size limits, LRU eviction, empty-key eviction, TTL expiry, overwrite accounting). Plain C++17 asserts, zero framework.
+Expected:
 
-## Limitations & future work
+```
+ok test_protocol
+ok test_storage
+```
 
-- **AOF durability:** flush, not fsync; no rewrite/compaction; base64 inflates values ~33%. Best-effort replay log, not a durable database.
-- **Single-threaded:** a 512MB SET/GET or slow client can stall others. No worker threads for per-connection outboxes.
-- **No auth, TLS, or `maxclients`:** binds all interfaces. Run behind a proxy.
-- **RESP2 subset:** no hashes, lists, sets, streams, transactions, pub/sub, `SCAN`, `MGET`/`MSET`. `SELECT` accepted and ignored.
-- **SET modifiers:** `NX`/`XX`/`GET`/`KEEPTTL` rejected, not implemented.
-- **TTL granularity:** seconds; `PX` rounds up. AOF replay re-applies TTL as a fresh duration.
-- **Memory accounting is an estimate:** capacity + 128B/entry + bucket array; RSS can exceed the limit.
-- **Single node:** no replication or clustering; cache state is in RAM.
+The tests are plain C++17 asserts with no framework. `test_protocol` covers single and pipelined commands, byte-by-byte fragmentation, a 1MiB binary payload containing `\r\n`, `\0`, and `0xff`, split trailers, oversized bulks, bad headers, empty arrays, unknown verbs, and empty keys/values. `test_storage` covers binary round-trip with `memcmp`, size limits, LRU eviction, the empty-key eviction regression, TTL expiry, and overwrite accounting.
 
-## Tech stack & contact
+Not covered by automated tests: the server event loop, AOF replay, admin HTTP, and multi-client behavior. I verified AOF replay and a 512MiB binary round-trip manually.
 
-C++17 · Linux `epoll` (macOS `poll` shim) · `nlohmann/json` (sole vendored dependency) · Docker.
+## Limitations and future work
 
-GitHub: https://github.com/ima-d-ice
+- **AOF is a replay log, not a database.** Flush is not `fsync`; there is no rewrite/compaction; base64 adds ~33%; replay re-applies TTLs as full durations.
+- **Single-threaded by design.** A 512MiB operation blocks the loop; a slow reader can accumulate queued responses until the 1,024-chunk cap. There is no `maxclients` and no worker pool for large sends.
+- **No auth or TLS.** The cache and admin ports bind all interfaces. Run on a trusted network or behind a proxy.
+- **RESP2 subset.** No `MGET`/`MSET`/`SCAN`, hashes, lists, sets, streams, transactions, or pub/sub. `SELECT` is accepted and ignored. `SET` modifiers `NX`/`XX`/`GET`/`KEEPTTL` are rejected.
+- **Only LRU is reachable.** LFU and SIEVE implementations are in `src/eviction/` but no runtime switch exposes them.
+- **Memory accounting is an estimate.** The limit charges capacity, keys, metadata, and buckets, but RSS can exceed it due to allocator behavior.
+- **Single node.** No replication, clustering, or failover. This is a systems project, not a production Redis replacement.
+
+Next: `fsync`/group-commit policy, AOF compaction, server-loop and AOF integration tests, a multi-client saturation benchmark, and a real policy-selection interface.
+
+## Tech stack
+
+C++17 · POSIX sockets · `epoll` (Linux) with a `poll` shim (macOS) · `std::thread`/`std::mutex` · `nlohmann/json` (vendored) · Python 3 (benchmark and demo tooling) · Docker · GNU Make.
+
+## Contact
+
+GitHub: [@ima-d-ice](https://github.com/ima-d-ice) · Repo: [ima-d-ice/polycache](https://github.com/ima-d-ice/polycache)
+
+License: [MIT](LICENSE). Open to backend and systems engineering roles.
