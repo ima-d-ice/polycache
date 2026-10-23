@@ -8,7 +8,7 @@
 namespace protocol {
 
 struct Command {
-    enum Type : std::uint8_t { SET, GET, DEL, METRICS, SWITCH_POLICY, PING, SELECT, UNKNOWN };
+    enum Type : std::uint8_t { SET, GET, DEL, METRICS, PING, SELECT, UNKNOWN };
     Type type = UNKNOWN;
     std::string verb;              // original verb, for UNKNOWN/error replies
     std::vector<std::string> args; // arguments only (verb excluded)

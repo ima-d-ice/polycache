@@ -70,8 +70,6 @@ Command classify(vector<string>&& argv) {
         cmd.type = Command::DEL;
     } else if (upper == "METRICS") {
         cmd.type = Command::METRICS;
-    } else if (upper == "SWITCH_POLICY") {
-        cmd.type = Command::SWITCH_POLICY;
     } else if (upper == "PING") {
         cmd.type = Command::PING;
     } else if (upper == "SELECT") {

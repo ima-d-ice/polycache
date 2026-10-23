@@ -44,10 +44,6 @@ bool Storage::set(string key, string value, int ttl_sec) {
         KeyMeta meta;
         meta.value = std::move(blob);
         meta.size = accounted;
-        meta.insert_seq = ++access_seq_;
-        meta.last_access_seq = ++access_seq_;
-        meta.freq = 1;
-        meta.visited = false;
 
         value_bytes_ += payload;
         largest_item_bytes_ = max(largest_item_bytes_, payload);
@@ -62,8 +58,6 @@ bool Storage::set(string key, string value, int ttl_sec) {
 
         meta.value = std::move(blob);
         meta.size = accounted;
-        meta.last_access_seq = ++access_seq_;
-        ++meta.freq;
         policy_->add(it->first, accounted);
     }
 
@@ -99,13 +93,9 @@ Blob Storage::get(const string& key) {
         return nullptr;
     }
 
-    KeyMeta& meta = it->second;
-    meta.last_access_seq = ++access_seq_;
-    ++meta.freq;
-    meta.visited = true;  // a hit marks the key visited (SIEVE)
     policy_->touch(key);
     ++hits_;
-    return meta.value;
+    return it->second.value;
 }
 
 bool Storage::del(const string& key) {
@@ -121,86 +111,6 @@ bool Storage::del(const string& key) {
     return true;
 }
 
-bool Storage::switch_policy(const string& name) {
-    lock_guard<mutex> lk(lock_);
-    string lower = name;
-    transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
-        return static_cast<char>(tolower(c));
-    });
-    unique_ptr<EvictionPolicy> next;
-    if (lower == "lru") {
-        next = make_unique<LRU>();
-    } else if (lower == "lfu") {
-        next = make_unique<LFU>();
-    } else if (lower == "sieve") {
-        next = make_unique<SIEVE>();
-    } else {
-        return false;
-    }
-
-    // Collect resident keys with their metadata, then rebuild the new policy
-    // in a deterministic order that preserves the eviction frontier. The old
-    // hash-random iteration (for (auto& [k,v] : data_)) scrambled the frontier
-    // and was the tax that made every switch a net loss.
-    vector<pair<const string*, KeyMeta*>> ordered;
-    ordered.reserve(data_.size());
-    for (auto& [key, meta] : data_) {
-        ordered.emplace_back(&key, &meta);
-    }
-
-    if (lower == "lru") {
-        // Coldest first: LRU::add pushes to the front, so the final list has
-        // the hottest key at the front and the least recent at the back, which
-        // is where LRU evicts from.
-        sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
-            return a.second->last_access_seq < b.second->last_access_seq;
-        });
-        for (auto& [key, meta] : ordered) {
-            next->add(*key, meta->size);
-        }
-    } else if (lower == "lfu") {
-        // Lowest frequency first, recency tiebreak => buckets come out ordered.
-        sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
-            if (a.second->freq != b.second->freq) {
-                return a.second->freq < b.second->freq;
-            }
-            return a.second->last_access_seq < b.second->last_access_seq;
-        });
-        for (auto& [key, meta] : ordered) {
-            next->add(*key, meta->size);
-        }
-    } else {  // sieve
-        // Recency order, coldest first. SIEVE evicts from the tail backward
-        // sweeping unvisited keys; with all visited bits cold after a rebuild,
-        // the tail is evicted first, so the least-recently-used keys must be at
-        // the tail. SIEVE.add() puts each new key at the head, so adding
-        // coldest-first leaves the coldest at the tail and the hottest at the
-        // head (furthest from the hand). Cold-start the visited bits.
-        sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
-            return a.second->last_access_seq < b.second->last_access_seq;
-        });
-        for (auto& [key, meta] : ordered) {
-            next->add(*key, meta->size);
-        }
-        // Restore the visited-bit frontier: a SIEVE rebuild cold-starts every
-        // visited bit to false, which makes every key immediately evictable
-        // and destroys the "recently accessed are protected" invariant. SIEVE
-        // evicts from the tail backward skipping visited keys, so replay the
-        // recently-accessed (visited) keys now that the hot ones sit near the
-        // head. This is a no-op for LRU/LFU (their touch() reorders, so the
-        // replay is skipped for them).
-        for (auto& [key, meta] : ordered) {
-            if (meta->visited) {
-                next->touch(*key);
-            }
-        }
-    }
-
-    policy_ = std::move(next);
-    policy_name_ = lower;
-    return true;
-}
-
 nlohmann::json Storage::metrics() const {
     lock_guard<mutex> lk(lock_);
     nlohmann::json j;
@@ -212,7 +122,6 @@ nlohmann::json Storage::metrics() const {
     j["used_memory_peak"] = max(used_memory_peak_, used);
     j["memory_limit"] = memory_limit_;
     j["max_value_size"] = max_value_size_;
-    j["policy"] = policy_name_;
     j["hits"] = hits_;
     j["misses"] = misses_;
     j["evictions"] = evictions_;

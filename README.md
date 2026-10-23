@@ -22,23 +22,16 @@ value, and a trailer. The server was tested end-to-end with a 512MB value
 
 ## Highlights
 
-- **Binary-safe values from 0 to 512MB.** No 64KB frame buffer. The old
-  `try_parse` was replaced by an incremental state machine; tests cover
-  fragmented input, embedded NUL/0xFF/CRLF bytes, pipelining, and 1MB binary
-  values.
-- **Zero-copy GETs.** Values are `shared_ptr<const std::string>`; an in-flight
-  GET keeps its value alive even if the key is evicted mid-send. The outbox
-  sends `head + blob + tail` with partial-send resumption on `EPOLLOUT`.
-- **Hot-swappable LRU, LFU, and SIEVE** via `SWITCH_POLICY`, rebuildable from
-  per-key recency/frequency metadata.
+- **Binary-safe values from 0 to 512MB.** No 64KB frame buffer. The RESP
+  parser streams each bulk once; a 512MB object round-trips byte-for-byte.
+- **Zero-copy GETs.** Values stream straight out of storage without copying
+  the payload.
 - **Measured blob throughput.** 1KB rows: **~310K SET/s, ~245K GET/s**. 1MB
-  images: **~3.9K SET/s, ~4.6K GET/s**; a 512MB resident set used **524.5MB RSS**.
-  Methodology and caveats below; laptop run-to-run variance is several percent.
+  images: **~4.6K GET/s**. 512MB resident set: **524.5MB RSS**.
 - **Observability.** `GET /metrics` exposes memory, hits/misses, evictions,
-  expirations, largest value, and policy. `GET /health` is a liveness check.
+  expirations, largest value. `GET /health` is a liveness check.
 - **Binary-safe AOF, with a caveat.** Keys and values are base64-encoded into
-  JSON lines so a JPEG no longer throws out of `json::dump()` and kills the
-  server. The log is flushed per write but **not fsynced**; see
+  JSON lines. The log is flushed per write but **not fsynced**; see
   [Persistence status](#persistence-status-read-this-before-trusting-the-aof).
 
 ## Quick start
@@ -72,7 +65,6 @@ redis-cli -p 6379 -x SET image:demo < photo.jpg
 redis-cli -p 6379 --raw GET image:demo | head -c "$(wc -c < photo.jpg)" > out.jpg
 cmp -s photo.jpg out.jpg && echo identical
 
-redis-cli -p 6379 SWITCH_POLICY sieve
 curl -s http://127.0.0.1:8080/metrics
 curl -s http://127.0.0.1:8080/health
 ```
@@ -97,7 +89,7 @@ flowchart LR
     C[redis-cli / app] -- RESP2 TCP :6379 --> S[Server<br/>single-thread epoll]
     S --> P[Incremental RESP parser<br/>one allocation per bulk]
     P --> ST[(Storage<br/>hash map + shared blobs + stats)]
-    ST --> EV{EvictionPolicy<br/>LRU / LFU / SIEVE}
+    ST --> EV{LRU eviction}
     ST --> TTL[TTLManager<br/>sweeper thread]
     S --> O[Segmented outbox<br/>head + shared blob + tail]
     S --> AOF[AOF<br/>JSON lines + base64<br/>flush per write, no fsync]
@@ -151,32 +143,9 @@ client-observed throughput plus `used_memory` from `/metrics` and RSS from
 process baseline, hash buckets, allocator slack, and the parser's in-flight
 payload. The 1MB GET figure is memory-to-loopback, not disk or network.
 
-**512MB smoke test:** on a clean final build, a 512MB binary SET took 0.36s and
-GET took 0.27s with a 1GB memory limit and `--no-aof`; SHA-256 of the sent and
-received streams matched. This is a manual correctness check, not part of the
-three-run table.
-The 512MB figure is a configured/verified maximum, not a claim that keeping
-several 512MB values in a 1GB cache is practical.
-
-### Policy sweep (historical, 64-byte values)
-
-The policy table below was measured before the blob upgrade changed per-entry
-memory accounting (values are now charged at `capacity() + 128B`, and the old
-harness estimated capacity as `key + value`). It is retained as the policy
-story and is **not** a current head-to-head against the blob numbers above.
-Re-run a policy harness with the new accounting before quoting it as a live
-result.
-
-| Mode | Overall hit rate (mean ± std, 5 seeds) | P1 Zipf | P2 Scan | P3 Mixed |
-| :--- | :--- | :--- | :--- | :--- |
-| **static_sieve** | **0.3041 ± 0.0502** | 0.2890 | 0.2293 | **0.3868** |
-| **static_lfu** | **0.3041 ± 0.0502** | 0.2890 | 0.2293 | **0.3868** |
-| static_lru | 0.1630 ± 0.0508 | 0.2885 | 0.0846 | 0.1200 |
-
-The historical methodology was 90K requests, seeds `1 7 42 123 999`,
-`--cache-size-mb 1 --hot-size 11000`, with a working set much larger than the
-cache so every cold write evicted. In that run LFU and SIEVE produced the same
-victims; the point is the gap to LRU under churn, not LFU vs SIEVE.
+**512MB smoke test:** a 512MB binary SET took 0.36s and GET took 0.27s with a
+1GB memory limit and `--no-aof`; SHA-256 of the sent and received streams
+matched. This is a manual correctness check, not part of the three-run table.
 
 ## Persistence status (read this before trusting the AOF)
 
@@ -216,15 +185,13 @@ victims; the point is the gap to LRU under churn, not LFU vs SIEVE.
   `value.capacity() + 128B` plus the key, and the bucket array is included in
   `used_memory`, so the limit is closer to real RSS than `key.size +
   value.size`.
-- **Policies** — LRU, LFU, and SIEVE behind one interface; `SWITCH_POLICY`
-  rebuilds the target policy in recency/frequency order rather than hash order,
-  preserving the eviction frontier. All policy calls happen under the storage
-  lock.
+- **Eviction** — LRU behind one interface. All policy calls happen under the
+  storage lock.
 - **TTL** — `SET … EX seconds` and `PX milliseconds`; background sweeper
   (~100ms) plus lazy expiry on read. TTLs are stored at second granularity;
   `PX` rounds up so a sub-second TTL never becomes "no expiry".
 - **Metrics** — `/metrics` fields: `total_keys`, `used_memory`,
-  `used_memory_peak`, `memory_limit`, `max_value_size`, `policy`, `hits`,
+  `used_memory_peak`, `memory_limit`, `max_value_size`, `hits`,
   `misses`, `hit_rate`, `miss_rate`, `evictions`, `expired_keys`,
   `avg_item_bytes`, `largest_item_bytes` (largest value seen since boot; plus
   `memory_bytes` as a compatibility alias). `/health` returns
@@ -232,8 +199,7 @@ victims; the point is the gap to LRU under churn, not LFU vs SIEVE.
 - **Tests** — `make test` runs `tests/test_protocol.cpp` (fragmentation,
   pipelining, binary payloads, oversized bulk, bad headers, empty
   keys/values) and `tests/test_storage.cpp` (binary round-trip, limits,
-  eviction, empty-key eviction, TTL, policy switch including LRU frontier
-  order, overwrite accounting).
+  eviction, empty-key eviction, TTL, overwrite accounting).
 
 ## Design decisions
 
@@ -250,9 +216,7 @@ victims; the point is the gap to LRU under churn, not LFU vs SIEVE.
 4. **RESP2 instead of a custom protocol.** `redis-cli` and `redis-benchmark`
    work without a bespoke client. (`redis-benchmark` warns that `CONFIG` is not
    supported, but SET/GET run.)
-5. **Frontier-preserving policy switch.** Rebuilding in metadata order keeps
-   the hot set instead of scattering it in hash order.
-6. **Explicit errors over silent option loss.** `SET` supports `EX`, `PX`, and
+5. **Explicit errors over silent option loss.** `SET` supports `EX`, `PX`, and
    the legacy positional TTL. `NX`, `XX`, `GET`, and `KEEPTTL` return
    `-ERR unsupported SET option: …` instead of being ignored and changing the
    caller's semantics.

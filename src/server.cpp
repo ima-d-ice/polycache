@@ -393,18 +393,6 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
                             nullptr, ""};
         }
 
-        case protocol::Command::SWITCH_POLICY: {
-            if (cmd.args.empty()) {
-                return Response{"-ERR wrong number of arguments for SWITCH_POLICY",
-                                nullptr, ""};
-            }
-            const bool ok = storage_->switch_policy(cmd.args[0]);
-            if (!ok) {
-                return Response{"-ERR unknown policy: " + cmd.args[0], nullptr, ""};
-            }
-            return Response{"+OK", nullptr, ""};
-        }
-
         case protocol::Command::UNKNOWN:
         default:
             if (cmd.verb.empty()) {

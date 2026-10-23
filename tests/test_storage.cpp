@@ -85,42 +85,6 @@ void test_ttl() {
     assert(storage.metrics()["expired_keys"].get<size_t>() >= 1);
 }
 
-void test_policy_switch() {
-    Storage storage(8 * kMB, 4 * kMB);
-    assert(storage.set("a", "1", 0));
-    assert(storage.set("b", "2", 0));
-    assert(storage.switch_policy("lru"));
-    assert(storage.get("a") != nullptr);
-    assert(storage.switch_policy("LFU"));
-    assert(storage.get("b") != nullptr);
-    assert(storage.switch_policy("sieve"));
-    assert(storage.get("a") != nullptr);
-    assert(!storage.switch_policy("nope"));
-    assert(storage.metrics()["policy"] == "sieve");
-}
-
-void test_lru_switch_order() {
-    // Rebuilding LRU from metadata must not turn the hottest key into the
-    // eviction victim. get("a") makes a recently used; b is then the oldest
-    // entry. After a same-policy rebuild, inserting d must evict b, not a.
-    Storage storage(4 * kMB, 1 * kMB);
-    const string blob = make_blob(kMB, 11);
-    assert(storage.set("a", blob, 0));
-    assert(storage.set("b", blob, 0));
-    assert(storage.set("c", blob, 0));
-    assert(storage.get("a") != nullptr);
-    assert(storage.metrics()["evictions"] == 0);
-
-    assert(storage.switch_policy("lru"));
-    assert(storage.set("d", blob, 0));
-
-    assert(storage.metrics()["evictions"] == 1);
-    assert(storage.get("b") == nullptr);  // oldest entry
-    assert(storage.get("a") != nullptr);
-    assert(storage.get("c") != nullptr);
-    assert(storage.get("d") != nullptr);
-}
-
 void test_overwrite_accounting() {
     Storage storage(8 * kMB, 4 * kMB);
     assert(storage.set("k", string(kMB, 'a'), 0));
@@ -140,8 +104,6 @@ int main() {
     test_lru_eviction();
     test_empty_key_eviction();
     test_ttl();
-    test_policy_switch();
-    test_lru_switch_order();
     test_overwrite_accounting();
     printf("ok test_storage\n");
     return 0;
